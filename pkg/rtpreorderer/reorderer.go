@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	bufferSize = 64
+	defaultBufferSize = 64
 )
 
 // Reorderer filters incoming RTP packets, in order to
@@ -18,18 +18,31 @@ type Reorderer struct {
 	buffer         []*rtp.Packet
 	absPos         uint16
 	negativeCount  int
+
+	// Maximum number of packets to buffer for reordering
+	BufferSize int
 }
 
 // New allocates a Reorderer.
+//
+// Deprecated: replaced by Initialize().
 func New() *Reorderer {
-	return &Reorderer{
-		buffer: make([]*rtp.Packet, bufferSize),
+	r := &Reorderer{}
+	r.Initialize()
+	return r
+}
+
+// Initialize initializes a Reorderer.
+func (r *Reorderer) Initialize() {
+	if r.BufferSize == 0 {
+		r.BufferSize = defaultBufferSize
 	}
+	r.buffer = make([]*rtp.Packet, r.BufferSize)
 }
 
 // Process processes a RTP packet.
 // It returns a sequence of ordered packets and the number of lost packets.
-func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
+func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, uint) {
 	if !r.initialized {
 		r.initialized = true
 		r.expectedSeqNum = pkt.SequenceNumber + 1
@@ -45,12 +58,12 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 		r.negativeCount++
 
 		// stream has been resetted, therefore reset reorderer too
-		if r.negativeCount > bufferSize {
+		if r.negativeCount > r.BufferSize {
 			r.negativeCount = 0
 
 			// clear buffer
-			for i := uint16(0); i < bufferSize; i++ {
-				p := (r.absPos + i) & (bufferSize - 1)
+			for i := uint16(0); i < uint16(r.BufferSize); i++ {
+				p := (r.absPos + i) & (uint16(r.BufferSize) - 1)
 				r.buffer[p] = nil
 			}
 
@@ -65,10 +78,10 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 
 	// there's a missing packet and buffer is full.
 	// return entire buffer and clear it.
-	if relPos >= bufferSize {
+	if relPos >= int16(r.BufferSize) {
 		n := 1
-		for i := uint16(0); i < bufferSize; i++ {
-			p := (r.absPos + i) & (bufferSize - 1)
+		for i := uint16(0); i < uint16(r.BufferSize); i++ {
+			p := (r.absPos + i) & (uint16(r.BufferSize) - 1)
 			if r.buffer[p] != nil {
 				n++
 			}
@@ -77,8 +90,8 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 		ret := make([]*rtp.Packet, n)
 		pos := 0
 
-		for i := uint16(0); i < bufferSize; i++ {
-			p := (r.absPos + i) & (bufferSize - 1)
+		for i := uint16(0); i < uint16(r.BufferSize); i++ {
+			p := (r.absPos + i) & (uint16(r.BufferSize) - 1)
 			if r.buffer[p] != nil {
 				ret[pos], r.buffer[p] = r.buffer[p], nil
 				pos++
@@ -88,12 +101,12 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 		ret[pos] = pkt
 
 		r.expectedSeqNum = pkt.SequenceNumber + 1
-		return ret, int(relPos) - n + 1
+		return ret, uint(int(relPos) - n + 1)
 	}
 
 	// there's a missing packet
 	if relPos != 0 {
-		p := (r.absPos + uint16(relPos)) & (bufferSize - 1)
+		p := (r.absPos + uint16(relPos)) & (uint16(r.BufferSize) - 1)
 
 		// current packet is a duplicate. discard
 		if r.buffer[p] != nil {
@@ -110,7 +123,7 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 
 	n := uint16(1)
 	for {
-		p := (r.absPos + n) & (bufferSize - 1)
+		p := (r.absPos + n) & (uint16(r.BufferSize) - 1)
 		if r.buffer[p] == nil {
 			break
 		}
@@ -121,12 +134,12 @@ func (r *Reorderer) Process(pkt *rtp.Packet) ([]*rtp.Packet, int) {
 
 	ret[0] = pkt
 	r.absPos++
-	r.absPos &= (bufferSize - 1)
+	r.absPos &= (uint16(r.BufferSize) - 1)
 
 	for i := uint16(1); i < n; i++ {
 		ret[i], r.buffer[r.absPos] = r.buffer[r.absPos], nil
 		r.absPos++
-		r.absPos &= (bufferSize - 1)
+		r.absPos &= (uint16(r.BufferSize) - 1)
 	}
 
 	r.expectedSeqNum = pkt.SequenceNumber + n

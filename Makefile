@@ -1,5 +1,5 @@
-BASE_IMAGE = golang:1.23-alpine3.20
-LINT_IMAGE = golangci/golangci-lint:v1.61.0
+BASE_IMAGE = golang:1.24-alpine3.20
+LINT_IMAGE = golangci/golangci-lint:v1.64.5
 
 .PHONY: $(shell ls)
 
@@ -11,8 +11,8 @@ help:
 	@echo "  mod-tidy        run go mod tidy"
 	@echo "  format          format source files"
 	@echo "  test            run tests"
-	@echo "  test32          run tests on a 32-bit system"
-	@echo "  test-highlevel  run high-level tests"
+	@echo "  test-32         run tests on a 32-bit system"
+	@echo "  test-e2e        run end-to-end tests"
 	@echo "  lint            run linter"
 	@echo "  bench           run benchmarks"
 	@echo ""

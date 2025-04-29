@@ -239,6 +239,8 @@ func (e ErrServerUnexpectedResponse) Error() string {
 type ErrServerWriteQueueFull = ErrClientWriteQueueFull
 
 // ErrServerRTPPacketsLost is an error that can be returned by a server.
+//
+// Deprecated: will be removed in next version.
 type ErrServerRTPPacketsLost = ErrClientRTPPacketsLost
 
 // ErrServerRTPPacketUnknownPayloadType is an error that can be returned by a server.
@@ -269,4 +271,14 @@ func (ErrServerInvalidSetupPath) Error() string {
 	return "invalid SETUP path. " +
 		"This typically happens when VLC fails a request, and then switches to an " +
 		"unsupported RTSP dialect"
+}
+
+// ErrServerAuth is an error that can be returned by a server.
+// If a client did not provide credentials, it will be asked for
+// credentials instead of being kicked out.
+type ErrServerAuth struct{}
+
+// Error implements the error interface.
+func (e ErrServerAuth) Error() string {
+	return "authentication error"
 }

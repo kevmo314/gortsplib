@@ -13,6 +13,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -27,8 +28,14 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/bluenviron/gortsplib/v4/pkg/liberrors"
+	"github.com/bluenviron/gortsplib/v4/pkg/rtcpreceiver"
+	"github.com/bluenviron/gortsplib/v4/pkg/rtcpsender"
 	"github.com/bluenviron/gortsplib/v4/pkg/rtptime"
 	"github.com/bluenviron/gortsplib/v4/pkg/sdp"
+)
+
+const (
+	clientUserAgent = "gortsplib"
 )
 
 // avoid an int64 overflow and preserve resolution by splitting division into two parts:
@@ -210,7 +217,12 @@ type ClientOnResponseFunc func(*base.Response)
 type ClientOnTransportSwitchFunc func(err error)
 
 // ClientOnPacketLostFunc is the prototype of Client.OnPacketLost.
+//
+// Deprecated: replaced by ClientOnPacketsLostFunc
 type ClientOnPacketLostFunc func(err error)
+
+// ClientOnPacketsLostFunc is the prototype of Client.OnPacketsLost.
+type ClientOnPacketsLostFunc func(lost uint64)
 
 // ClientOnDecodeErrorFunc is the prototype of Client.OnDecodeError.
 type ClientOnDecodeErrorFunc func(err error)
@@ -269,8 +281,12 @@ type Client struct {
 	// explicitly request back channels to the server.
 	RequestBackChannels bool
 	// pointer to a variable that stores received bytes.
+	//
+	// Deprecated: use Client.Stats()
 	BytesReceived *uint64
 	// pointer to a variable that stores sent bytes.
+	//
+	// Deprecated: use Client.Stats()
 	BytesSent *uint64
 
 	//
@@ -297,7 +313,11 @@ type Client struct {
 	// called when the transport protocol changes.
 	OnTransportSwitch ClientOnTransportSwitchFunc
 	// called when the client detects lost packets.
+	//
+	// Deprecated: replaced by OnPacketsLost
 	OnPacketLost ClientOnPacketLostFunc
+	// called when the client detects lost packets.
+	OnPacketsLost ClientOnPacketsLostFunc
 	// called when a non-fatal decode error occurs.
 	OnDecodeError ClientOnDecodeErrorFunc
 
@@ -326,7 +346,7 @@ type Client struct {
 	effectiveTransport   *Transport
 	backChannelSetupped  bool
 	stdChannelSetupped   bool
-	medias               map[*description.Media]*clientMedia
+	setuppedMedias       map[*description.Media]*clientMedia
 	tcpCallbackByChannel map[int]readFunc
 	lastRange            *headers.Range
 	checkTimeoutTimer    *time.Timer
@@ -335,22 +355,24 @@ type Client struct {
 	keepalivePeriod      time.Duration
 	keepaliveTimer       *time.Timer
 	closeError           error
-	writer               asyncProcessor
+	writer               *asyncProcessor
+	writerMutex          sync.RWMutex
 	reader               *clientReader
 	timeDecoder          *rtptime.GlobalDecoder2
 	mustClose            bool
+	tcpFrame             *base.InterleavedFrame
+	tcpBuffer            []byte
+	bytesReceived        *uint64
+	bytesSent            *uint64
 
 	// in
-	chOptions      chan optionsReq
-	chDescribe     chan describeReq
-	chAnnounce     chan announceReq
-	chSetup        chan setupReq
-	chPlay         chan playReq
-	chRecord       chan recordReq
-	chPause        chan pauseReq
-	chReadError    chan error
-	chReadResponse chan *base.Response
-	chReadRequest  chan *base.Request
+	chOptions  chan optionsReq
+	chDescribe chan describeReq
+	chAnnounce chan announceReq
+	chSetup    chan setupReq
+	chPlay     chan playReq
+	chRecord   chan recordReq
+	chPause    chan pauseReq
 
 	// out
 	done chan struct{}
@@ -379,13 +401,7 @@ func (c *Client) Start(scheme string, host string) error {
 		return fmt.Errorf("MaxPacketSize must be less than %d", udpMaxPayloadSize)
 	}
 	if c.UserAgent == "" {
-		c.UserAgent = "gortsplib"
-	}
-	if c.BytesReceived == nil {
-		c.BytesReceived = new(uint64)
-	}
-	if c.BytesSent == nil {
-		c.BytesSent = new(uint64)
+		c.UserAgent = clientUserAgent
 	}
 
 	// system functions
@@ -418,9 +434,21 @@ func (c *Client) Start(scheme string, host string) error {
 			log.Println(err.Error())
 		}
 	}
-	if c.OnPacketLost == nil {
-		c.OnPacketLost = func(err error) {
-			log.Println(err.Error())
+	if c.OnPacketLost != nil {
+		c.OnPacketsLost = func(lost uint64) {
+			c.OnPacketLost(liberrors.ErrClientRTPPacketsLost{Lost: uint(lost)}) //nolint:staticcheck
+		}
+	}
+	if c.OnPacketsLost == nil {
+		c.OnPacketsLost = func(lost uint64) {
+			log.Printf("%d RTP %s lost",
+				lost,
+				func() string {
+					if lost == 1 {
+						return "packet"
+					}
+					return "packets"
+				}())
 		}
 	}
 	if c.OnDecodeError == nil {
@@ -455,6 +483,18 @@ func (c *Client) Start(scheme string, host string) error {
 	c.checkTimeoutTimer = emptyTimer()
 	c.keepalivePeriod = 30 * time.Second
 	c.keepaliveTimer = emptyTimer()
+
+	if c.BytesReceived != nil {
+		c.bytesReceived = c.BytesReceived
+	} else {
+		c.bytesReceived = new(uint64)
+	}
+	if c.BytesSent != nil {
+		c.bytesSent = c.BytesSent
+	} else {
+		c.bytesSent = new(uint64)
+	}
+
 	c.chOptions = make(chan optionsReq)
 	c.chDescribe = make(chan describeReq)
 	c.chAnnounce = make(chan announceReq)
@@ -462,9 +502,6 @@ func (c *Client) Start(scheme string, host string) error {
 	c.chPlay = make(chan playReq)
 	c.chRecord = make(chan recordReq)
 	c.chPause = make(chan pauseReq)
-	c.chReadError = make(chan error)
-	c.chReadResponse = make(chan *base.Response)
-	c.chReadRequest = make(chan *base.Request)
 	c.done = make(chan struct{})
 
 	go c.run()
@@ -530,6 +567,34 @@ func (c *Client) run() {
 
 func (c *Client) runInner() error {
 	for {
+		chReaderResponse := func() chan *base.Response {
+			if c.reader != nil {
+				return c.reader.chResponse
+			}
+			return nil
+		}()
+
+		chReaderRequest := func() chan *base.Request {
+			if c.reader != nil {
+				return c.reader.chRequest
+			}
+			return nil
+		}()
+
+		chReaderError := func() chan error {
+			if c.reader != nil {
+				return c.reader.chError
+			}
+			return nil
+		}()
+
+		chWriterError := func() chan struct{} {
+			if c.writer != nil {
+				return c.writer.chStopped
+			}
+			return nil
+		}()
+
 		select {
 		case req := <-c.chOptions:
 			res, err := c.doOptions(req.url)
@@ -601,15 +666,18 @@ func (c *Client) runInner() error {
 			}
 			c.keepaliveTimer = time.NewTimer(c.keepalivePeriod)
 
-		case err := <-c.chReadError:
+		case <-chWriterError:
+			return c.writer.stopError
+
+		case err := <-chReaderError:
 			c.reader = nil
 			return err
 
-		case res := <-c.chReadResponse:
+		case res := <-chReaderResponse:
 			c.OnResponse(res)
 			// these are responses to keepalives, ignore them.
 
-		case req := <-c.chReadRequest:
+		case req := <-chReaderRequest:
 			err := c.handleServerRequest(req)
 			if err != nil {
 				return err
@@ -630,11 +698,11 @@ func (c *Client) waitResponse(requestCseqStr string) (*base.Response, error) {
 		case <-t.C:
 			return nil, liberrors.ErrClientRequestTimedOut{}
 
-		case err := <-c.chReadError:
+		case err := <-c.reader.chError:
 			c.reader = nil
 			return nil, err
 
-		case res := <-c.chReadResponse:
+		case res := <-c.reader.chResponse:
 			c.OnResponse(res)
 
 			// accept response if CSeq equals request CSeq, or if CSeq is not present
@@ -642,7 +710,7 @@ func (c *Client) waitResponse(requestCseqStr string) (*base.Response, error) {
 				return res, nil
 			}
 
-		case req := <-c.chReadRequest:
+		case req := <-c.reader.chRequest:
 			err := c.handleServerRequest(req)
 			if err != nil {
 				return nil, err
@@ -682,8 +750,8 @@ func (c *Client) handleServerRequest(req *base.Request) error {
 
 func (c *Client) doClose() {
 	if c.state == clientStatePlay || c.state == clientStateRecord {
-		c.stopWriter()
-		c.stopReadRoutines()
+		c.destroyWriter()
+		c.stopTransportRoutines()
 	}
 
 	if c.nconn != nil && c.baseURL != nil {
@@ -712,7 +780,7 @@ func (c *Client) doClose() {
 		c.conn = nil
 	}
 
-	for _, cm := range c.medias {
+	for _, cm := range c.setuppedMedias {
 		cm.close()
 	}
 }
@@ -730,7 +798,7 @@ func (c *Client) reset() {
 	c.effectiveTransport = nil
 	c.backChannelSetupped = false
 	c.stdChannelSetupped = false
-	c.medias = nil
+	c.setuppedMedias = nil
 	c.tcpCallbackByChannel = nil
 }
 
@@ -754,7 +822,7 @@ func (c *Client) trySwitchingProtocol() error {
 
 	prevConnURL := c.connURL
 	prevBaseURL := c.baseURL
-	prevMedias := c.medias
+	prevMedias := c.setuppedMedias
 
 	c.reset()
 
@@ -774,9 +842,9 @@ func (c *Client) trySwitchingProtocol() error {
 			return err
 		}
 
-		c.medias[i].onPacketRTCP = cm.onPacketRTCP
+		c.setuppedMedias[i].onPacketRTCP = cm.onPacketRTCP
 		for j, tr := range cm.formats {
-			c.medias[i].formats[j].onPacketRTP = tr.onPacketRTP
+			c.setuppedMedias[i].formats[j].onPacketRTP = tr.onPacketRTP
 		}
 	}
 
@@ -808,21 +876,17 @@ func (c *Client) trySwitchingProtocol2(medi *description.Media, baseURL *base.UR
 	return c.doSetup(baseURL, medi, 0, 0)
 }
 
-func (c *Client) startReadRoutines() {
-	// allocate writer here because it's needed by RTCP receiver / sender
-	if c.state == clientStateRecord || c.backChannelSetupped {
-		c.writer.allocateBuffer(c.WriteQueueSize)
-	} else {
-		// when reading, buffer is only used to send RTCP receiver reports,
-		// that are much smaller than RTP packets and are sent at a fixed interval.
-		// decrease RAM consumption by allocating less buffers.
-		c.writer.allocateBuffer(8)
+func (c *Client) startTransportRoutines() {
+	c.timeDecoder = &rtptime.GlobalDecoder2{}
+	c.timeDecoder.Initialize()
+
+	for _, cm := range c.setuppedMedias {
+		cm.start()
 	}
 
-	c.timeDecoder = rtptime.NewGlobalDecoder2()
-
-	for _, cm := range c.medias {
-		cm.start()
+	if *c.effectiveTransport == TransportTCP {
+		c.tcpFrame = &base.InterleavedFrame{}
+		c.tcpBuffer = make([]byte, c.MaxPacketSize+4)
 	}
 
 	if c.state == clientStatePlay && c.stdChannelSetupped {
@@ -848,7 +912,7 @@ func (c *Client) startReadRoutines() {
 	}
 }
 
-func (c *Client) stopReadRoutines() {
+func (c *Client) stopTransportRoutines() {
 	if c.reader != nil {
 		c.reader.setAllowInterleavedFrames(false)
 	}
@@ -856,19 +920,44 @@ func (c *Client) stopReadRoutines() {
 	c.checkTimeoutTimer = emptyTimer()
 	c.keepaliveTimer = emptyTimer()
 
-	for _, cm := range c.medias {
+	for _, cm := range c.setuppedMedias {
 		cm.stop()
 	}
 
 	c.timeDecoder = nil
 }
 
+func (c *Client) createWriter() {
+	c.writerMutex.Lock()
+
+	c.writer = &asyncProcessor{
+		bufferSize: func() int {
+			if c.state == clientStateRecord || c.backChannelSetupped {
+				return c.WriteQueueSize
+			}
+
+			// when reading, buffer is only used to send RTCP receiver reports,
+			// that are much smaller than RTP packets and are sent at a fixed interval.
+			// decrease RAM consumption by allocating less buffers.
+			return 8
+		}(),
+	}
+
+	c.writer.initialize()
+
+	c.writerMutex.Unlock()
+}
+
 func (c *Client) startWriter() {
 	c.writer.start()
 }
 
-func (c *Client) stopWriter() {
-	c.writer.stop()
+func (c *Client) destroyWriter() {
+	c.writer.close()
+
+	c.writerMutex.Lock()
+	c.writer = nil
+	c.writerMutex.Unlock()
 }
 
 func (c *Client) connOpen() error {
@@ -903,7 +992,7 @@ func (c *Client) connOpen() error {
 	}
 
 	c.nconn = nconn
-	bc := bytecounter.New(c.nconn, c.BytesReceived, c.BytesSent)
+	bc := bytecounter.New(c.nconn, c.bytesReceived, c.bytesSent)
 	c.conn = conn.NewConn(bc)
 	c.reader = &clientReader{
 		c: c,
@@ -960,7 +1049,7 @@ func (c *Client) do(req *base.Request, skipResponse bool) (*base.Response, error
 	// get session from response
 	if v, ok := res.Header["Session"]; ok {
 		var sx headers.Session
-		err := sx.Unmarshal(v)
+		err = sx.Unmarshal(v)
 		if err != nil {
 			return nil, liberrors.ErrClientSessionHeaderInvalid{Err: err}
 		}
@@ -976,7 +1065,12 @@ func (c *Client) do(req *base.Request, skipResponse bool) (*base.Response, error
 		pass, _ := req.URL.User.Password()
 		user := req.URL.User.Username()
 
-		sender, err := auth.NewSender(res.Header["WWW-Authenticate"], user, pass)
+		sender := &auth.Sender{
+			WWWAuth: res.Header["WWW-Authenticate"],
+			User:    user,
+			Pass:    pass,
+		}
+		err = sender.Initialize()
 		if err != nil {
 			return nil, liberrors.ErrClientAuthSetup{Err: err}
 		}
@@ -989,7 +1083,7 @@ func (c *Client) do(req *base.Request, skipResponse bool) (*base.Response, error
 }
 
 func (c *Client) atLeastOneUDPPacketHasBeenReceived() bool {
-	for _, ct := range c.medias {
+	for _, ct := range c.setuppedMedias {
 		lft := atomic.LoadInt64(ct.udpRTPListener.lastPacketTime)
 		if lft != 0 {
 			return true
@@ -1005,7 +1099,7 @@ func (c *Client) atLeastOneUDPPacketHasBeenReceived() bool {
 
 func (c *Client) isInUDPTimeout() bool {
 	now := c.timeNow()
-	for _, ct := range c.medias {
+	for _, ct := range c.setuppedMedias {
 		lft := time.Unix(atomic.LoadInt64(ct.udpRTPListener.lastPacketTime), 0)
 		if now.Sub(lft) < c.ReadTimeout {
 			return false
@@ -1315,9 +1409,10 @@ func (c *Client) doSetup(
 	}
 
 	cm := &clientMedia{
-		c:            c,
-		onPacketRTCP: func(rtcp.Packet) {},
+		c:     c,
+		media: medi,
 	}
+	cm.initialize()
 
 	if c.effectiveTransport == nil {
 		if c.connURL.Scheme == "rtsps" { // always use TCP if encrypted
@@ -1346,7 +1441,7 @@ func (c *Client) doSetup(
 			return nil, liberrors.ErrClientUDPPortsNotConsecutive{}
 		}
 
-		err = cm.allocateUDPListeners(
+		err = cm.createUDPListeners(
 			false,
 			nil,
 			net.JoinHostPort("", strconv.FormatInt(int64(rtpPort), 10)),
@@ -1501,7 +1596,7 @@ func (c *Client) doSetup(
 			readIP = c.nconn.RemoteAddr().(*net.TCPAddr).IP
 		}
 
-		err = cm.allocateUDPListeners(
+		err = cm.createUDPListeners(
 			true,
 			readIP,
 			net.JoinHostPort(thRes.Destination.String(), strconv.FormatInt(int64(thRes.Ports[0]), 10)),
@@ -1551,12 +1646,11 @@ func (c *Client) doSetup(
 		cm.tcpChannel = thRes.InterleavedIDs[0]
 	}
 
-	if c.medias == nil {
-		c.medias = make(map[*description.Media]*clientMedia)
+	if c.setuppedMedias == nil {
+		c.setuppedMedias = make(map[*description.Media]*clientMedia)
 	}
 
-	c.medias[medi] = cm
-	cm.setMedia(medi)
+	c.setuppedMedias[medi] = cm
 
 	c.baseURL = baseURL
 	c.effectiveTransport = &desiredTransport
@@ -1575,7 +1669,7 @@ func (c *Client) doSetup(
 }
 
 func (c *Client) isChannelPairInUse(channel int) bool {
-	for _, cm := range c.medias {
+	for _, cm := range c.setuppedMedias {
 		if (cm.tcpChannel+1) == channel || cm.tcpChannel == channel || cm.tcpChannel == (channel+1) {
 			return true
 		}
@@ -1637,7 +1731,8 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 	}
 
 	c.state = clientStatePlay
-	c.startReadRoutines()
+	c.startTransportRoutines()
+	c.createWriter()
 
 	// Range is mandatory in Parrot Streaming Server
 	if ra == nil {
@@ -1662,13 +1757,15 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 		Header: header,
 	}, false)
 	if err != nil {
-		c.stopReadRoutines()
+		c.destroyWriter()
+		c.stopTransportRoutines()
 		c.state = clientStatePrePlay
 		return nil, err
 	}
 
 	if res.StatusCode != base.StatusOK {
-		c.stopReadRoutines()
+		c.destroyWriter()
+		c.stopTransportRoutines()
 		c.state = clientStatePrePlay
 		return nil, liberrors.ErrClientBadStatusCode{
 			Code: res.StatusCode, Message: res.StatusMessage,
@@ -1680,7 +1777,7 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 	// don't do this with multicast, otherwise the RTP packet is going to be broadcasted
 	// to all listeners, including us, messing up the stream.
 	if *c.effectiveTransport == TransportUDP {
-		for _, cm := range c.medias {
+		for _, cm := range c.setuppedMedias {
 			byts, _ := (&rtp.Packet{Header: rtp.Header{Version: 2}}).Marshal()
 			cm.udpRTPListener.write(byts) //nolint:errcheck
 
@@ -1690,6 +1787,7 @@ func (c *Client) doPlay(ra *headers.Range) (*base.Response, error) {
 	}
 
 	c.startWriter()
+
 	c.lastRange = ra
 
 	return res, nil
@@ -1718,20 +1816,23 @@ func (c *Client) doRecord() (*base.Response, error) {
 	}
 
 	c.state = clientStateRecord
-	c.startReadRoutines()
+	c.startTransportRoutines()
+	c.createWriter()
 
 	res, err := c.do(&base.Request{
 		Method: base.Record,
 		URL:    c.baseURL,
 	}, false)
 	if err != nil {
-		c.stopReadRoutines()
+		c.destroyWriter()
+		c.stopTransportRoutines()
 		c.state = clientStatePreRecord
 		return nil, err
 	}
 
 	if res.StatusCode != base.StatusOK {
-		c.stopReadRoutines()
+		c.destroyWriter()
+		c.stopTransportRoutines()
 		c.state = clientStatePreRecord
 		return nil, liberrors.ErrClientBadStatusCode{
 			Code: res.StatusCode, Message: res.StatusMessage,
@@ -1766,25 +1867,27 @@ func (c *Client) doPause() (*base.Response, error) {
 		return nil, err
 	}
 
-	c.stopWriter()
+	c.destroyWriter()
 
 	res, err := c.do(&base.Request{
 		Method: base.Pause,
 		URL:    c.baseURL,
 	}, false)
 	if err != nil {
+		c.createWriter()
 		c.startWriter()
 		return nil, err
 	}
 
 	if res.StatusCode != base.StatusOK {
+		c.createWriter()
 		c.startWriter()
 		return nil, liberrors.ErrClientBadStatusCode{
 			Code: res.StatusCode, Message: res.StatusMessage,
 		}
 	}
 
-	c.stopReadRoutines()
+	c.stopTransportRoutines()
 
 	switch c.state {
 	case clientStatePlay:
@@ -1820,9 +1923,9 @@ func (c *Client) Seek(ra *headers.Range) (*base.Response, error) {
 	return c.Play(ra)
 }
 
-// OnPacketRTPAny sets the callback that is called when a RTP packet is read from any setupped media.
+// OnPacketRTPAny sets a callback that is called when a RTP packet is read from any setupped media.
 func (c *Client) OnPacketRTPAny(cb OnPacketRTPAnyFunc) {
-	for _, cm := range c.medias {
+	for _, cm := range c.setuppedMedias {
 		cmedia := cm.media
 		for _, forma := range cm.media.Formats {
 			c.OnPacketRTP(cm.media, forma, func(pkt *rtp.Packet) {
@@ -1832,9 +1935,9 @@ func (c *Client) OnPacketRTPAny(cb OnPacketRTPAnyFunc) {
 	}
 }
 
-// OnPacketRTCPAny sets the callback that is called when a RTCP packet is read from any setupped media.
+// OnPacketRTCPAny sets a callback that is called when a RTCP packet is read from any setupped media.
 func (c *Client) OnPacketRTCPAny(cb OnPacketRTCPAnyFunc) {
-	for _, cm := range c.medias {
+	for _, cm := range c.setuppedMedias {
 		cmedia := cm.media
 		c.OnPacketRTCP(cm.media, func(pkt rtcp.Packet) {
 			cb(cmedia, pkt)
@@ -1842,16 +1945,16 @@ func (c *Client) OnPacketRTCPAny(cb OnPacketRTCPAnyFunc) {
 	}
 }
 
-// OnPacketRTP sets the callback that is called when a RTP packet is read.
+// OnPacketRTP sets a callback that is called when a RTP packet is read.
 func (c *Client) OnPacketRTP(medi *description.Media, forma format.Format, cb OnPacketRTPFunc) {
-	cm := c.medias[medi]
+	cm := c.setuppedMedias[medi]
 	ct := cm.formats[forma.PayloadType()]
 	ct.onPacketRTP = cb
 }
 
-// OnPacketRTCP sets the callback that is called when a RTCP packet is read.
+// OnPacketRTCP sets a callback that is called when a RTCP packet is read.
 func (c *Client) OnPacketRTCP(medi *description.Media, cb OnPacketRTCPFunc) {
-	cm := c.medias[medi]
+	cm := c.setuppedMedias[medi]
 	cm.onPacketRTCP = cb
 }
 
@@ -1876,9 +1979,26 @@ func (c *Client) WritePacketRTPWithNTP(medi *description.Media, pkt *rtp.Packet,
 	default:
 	}
 
-	cm := c.medias[medi]
-	ct := cm.formats[pkt.PayloadType]
-	return ct.writePacketRTP(byts, pkt, ntp)
+	c.writerMutex.RLock()
+	defer c.writerMutex.RUnlock()
+
+	if c.writer == nil {
+		return nil
+	}
+
+	cm := c.setuppedMedias[medi]
+	cf := cm.formats[pkt.PayloadType]
+
+	cf.rtcpSender.ProcessPacket(pkt, ntp, cf.format.PTSEqualsDTS(pkt))
+
+	ok := c.writer.push(func() error {
+		return cf.writePacketRTPInQueue(byts)
+	})
+	if !ok {
+		return liberrors.ErrClientWriteQueueFull{}
+	}
+
+	return nil
 }
 
 // WritePacketRTCP writes a RTCP packet to the server.
@@ -1894,8 +2014,23 @@ func (c *Client) WritePacketRTCP(medi *description.Media, pkt rtcp.Packet) error
 	default:
 	}
 
-	cm := c.medias[medi]
-	return cm.writePacketRTCP(byts)
+	c.writerMutex.RLock()
+	defer c.writerMutex.RUnlock()
+
+	if c.writer == nil {
+		return nil
+	}
+
+	cm := c.setuppedMedias[medi]
+
+	ok := c.writer.push(func() error {
+		return cm.writePacketRTCPInQueue(byts)
+	})
+	if !ok {
+		return liberrors.ErrClientWriteQueueFull{}
+	}
+
+	return nil
 }
 
 // PacketPTS returns the PTS of an incoming RTP packet.
@@ -1903,7 +2038,7 @@ func (c *Client) WritePacketRTCP(medi *description.Media, pkt rtcp.Packet) error
 //
 // Deprecated: replaced by PacketPTS2.
 func (c *Client) PacketPTS(medi *description.Media, pkt *rtp.Packet) (time.Duration, bool) {
-	cm := c.medias[medi]
+	cm := c.setuppedMedias[medi]
 	ct := cm.formats[pkt.PayloadType]
 
 	v, ok := c.timeDecoder.Decode(ct.format, pkt)
@@ -1917,7 +2052,7 @@ func (c *Client) PacketPTS(medi *description.Media, pkt *rtp.Packet) (time.Durat
 // PacketPTS2 returns the PTS of an incoming RTP packet.
 // It is computed by decoding the packet timestamp and sychronizing it with other tracks.
 func (c *Client) PacketPTS2(medi *description.Media, pkt *rtp.Packet) (int64, bool) {
-	cm := c.medias[medi]
+	cm := c.setuppedMedias[medi]
 	ct := cm.formats[pkt.PayloadType]
 	return c.timeDecoder.Decode(ct.format, pkt)
 }
@@ -1925,19 +2060,197 @@ func (c *Client) PacketPTS2(medi *description.Media, pkt *rtp.Packet) (int64, bo
 // PacketNTP returns the NTP timestamp of an incoming RTP packet.
 // The NTP timestamp is computed from RTCP sender reports.
 func (c *Client) PacketNTP(medi *description.Media, pkt *rtp.Packet) (time.Time, bool) {
-	cm := c.medias[medi]
+	cm := c.setuppedMedias[medi]
 	ct := cm.formats[pkt.PayloadType]
 	return ct.rtcpReceiver.PacketNTP(pkt.Timestamp)
 }
 
-func (c *Client) readResponse(res *base.Response) {
-	c.chReadResponse <- res
-}
+// Stats returns client statistics.
+func (c *Client) Stats() *ClientStats {
+	return &ClientStats{
+		Conn: StatsConn{
+			BytesReceived: atomic.LoadUint64(c.bytesReceived),
+			BytesSent:     atomic.LoadUint64(c.bytesSent),
+		},
+		Session: StatsSession{
+			BytesReceived: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.bytesReceived)
+				}
+				return v
+			}(),
+			BytesSent: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.bytesSent)
+				}
+				return v
+			}(),
+			RTPPacketsReceived: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					for _, f := range sm.formats {
+						v += atomic.LoadUint64(f.rtpPacketsReceived)
+					}
+				}
+				return v
+			}(),
+			RTPPacketsSent: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					for _, f := range sm.formats {
+						v += atomic.LoadUint64(f.rtpPacketsSent)
+					}
+				}
+				return v
+			}(),
+			RTPPacketsLost: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					for _, f := range sm.formats {
+						v += atomic.LoadUint64(f.rtpPacketsLost)
+					}
+				}
+				return v
+			}(),
+			RTPPacketsInError: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.rtpPacketsInError)
+				}
+				return v
+			}(),
+			RTPPacketsJitter: func() float64 {
+				v := float64(0)
+				n := float64(0)
+				for _, sm := range c.setuppedMedias {
+					for _, fo := range sm.formats {
+						if fo.rtcpReceiver != nil {
+							stats := fo.rtcpReceiver.Stats()
+							if stats != nil {
+								v += stats.Jitter
+								n++
+							}
+						}
+					}
+				}
+				if n != 0 {
+					return v / n
+				}
+				return 0
+			}(),
+			RTCPPacketsReceived: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.rtcpPacketsReceived)
+				}
+				return v
+			}(),
+			RTCPPacketsSent: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.rtcpPacketsSent)
+				}
+				return v
+			}(),
+			RTCPPacketsInError: func() uint64 {
+				v := uint64(0)
+				for _, sm := range c.setuppedMedias {
+					v += atomic.LoadUint64(sm.rtcpPacketsInError)
+				}
+				return v
+			}(),
+			Medias: func() map[*description.Media]StatsSessionMedia { //nolint:dupl
+				ret := make(map[*description.Media]StatsSessionMedia, len(c.setuppedMedias))
 
-func (c *Client) readRequest(req *base.Request) {
-	c.chReadRequest <- req
-}
+				for med, sm := range c.setuppedMedias {
+					ret[med] = StatsSessionMedia{
+						BytesReceived:       atomic.LoadUint64(sm.bytesReceived),
+						BytesSent:           atomic.LoadUint64(sm.bytesSent),
+						RTPPacketsInError:   atomic.LoadUint64(sm.rtpPacketsInError),
+						RTCPPacketsReceived: atomic.LoadUint64(sm.rtcpPacketsReceived),
+						RTCPPacketsSent:     atomic.LoadUint64(sm.rtcpPacketsSent),
+						RTCPPacketsInError:  atomic.LoadUint64(sm.rtcpPacketsInError),
+						Formats: func() map[format.Format]StatsSessionFormat {
+							ret := make(map[format.Format]StatsSessionFormat, len(sm.formats))
 
-func (c *Client) readError(err error) {
-	c.chReadError <- err
+							for _, fo := range sm.formats {
+								recvStats := func() *rtcpreceiver.Stats {
+									if fo.rtcpReceiver != nil {
+										return fo.rtcpReceiver.Stats()
+									}
+									return nil
+								}()
+								sentStats := func() *rtcpsender.Stats {
+									if fo.rtcpSender != nil {
+										return fo.rtcpSender.Stats()
+									}
+									return nil
+								}()
+
+								ret[fo.format] = StatsSessionFormat{ //nolint:dupl
+									RTPPacketsReceived: atomic.LoadUint64(fo.rtpPacketsReceived),
+									RTPPacketsSent:     atomic.LoadUint64(fo.rtpPacketsSent),
+									RTPPacketsLost:     atomic.LoadUint64(fo.rtpPacketsLost),
+									LocalSSRC: func() uint32 {
+										if fo.rtcpReceiver != nil {
+											return *fo.rtcpReceiver.LocalSSRC
+										}
+										if sentStats != nil {
+											return sentStats.LocalSSRC
+										}
+										return 0
+									}(),
+									RemoteSSRC: func() uint32 {
+										if recvStats != nil {
+											return recvStats.RemoteSSRC
+										}
+										return 0
+									}(),
+									RTPPacketsLastSequenceNumber: func() uint16 {
+										if recvStats != nil {
+											return recvStats.LastSequenceNumber
+										}
+										if sentStats != nil {
+											return sentStats.LastSequenceNumber
+										}
+										return 0
+									}(),
+									RTPPacketsLastRTP: func() uint32 {
+										if recvStats != nil {
+											return recvStats.LastRTP
+										}
+										if sentStats != nil {
+											return sentStats.LastRTP
+										}
+										return 0
+									}(),
+									RTPPacketsLastNTP: func() time.Time {
+										if recvStats != nil {
+											return recvStats.LastNTP
+										}
+										if sentStats != nil {
+											return sentStats.LastNTP
+										}
+										return time.Time{}
+									}(),
+									RTPPacketsJitter: func() float64 {
+										if recvStats != nil {
+											return recvStats.Jitter
+										}
+										return 0
+									}(),
+								}
+							}
+
+							return ret
+						}(),
+					}
+				}
+
+				return ret
+			}(),
+		},
+	}
 }

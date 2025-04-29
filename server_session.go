@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +20,8 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/bluenviron/gortsplib/v4/pkg/liberrors"
+	"github.com/bluenviron/gortsplib/v4/pkg/rtcpreceiver"
+	"github.com/bluenviron/gortsplib/v4/pkg/rtcpsender"
 	"github.com/bluenviron/gortsplib/v4/pkg/rtptime"
 	"github.com/bluenviron/gortsplib/v4/pkg/sdp"
 )
@@ -186,7 +189,7 @@ func generateRTPInfo(
 			Scheme: u.Scheme,
 			Host:   u.Host,
 			Path: setuppedPath + "/trackID=" +
-				strconv.FormatInt(int64(setuppedStream.streamMedias[sm.media].trackID), 10),
+				strconv.FormatInt(int64(setuppedStream.medias[sm.media].trackID), 10),
 		}).String()
 		ri = append(ri, entry)
 	}
@@ -235,8 +238,6 @@ type ServerSession struct {
 	secretID              string // must not be shared, allows to take ownership of the session
 	ctx                   context.Context
 	ctxCancel             func()
-	bytesReceived         *uint64
-	bytesSent             *uint64
 	userData              interface{}
 	conns                 map[*ServerConn]struct{}
 	state                 ServerSessionState
@@ -252,13 +253,16 @@ type ServerSession struct {
 	announcedDesc         *description.Session // publish
 	udpLastPacketTime     *int64               // publish
 	udpCheckStreamTimer   *time.Timer
-	writer                asyncProcessor
+	writer                *asyncProcessor
+	writerMutex           sync.RWMutex
 	timeDecoder           *rtptime.GlobalDecoder2
+	tcpFrame              *base.InterleavedFrame
+	tcpBuffer             []byte
 
 	// in
-	chHandleRequest chan sessionRequestReq
-	chRemoveConn    chan *ServerConn
-	chStartWriter   chan struct{}
+	chHandleRequest    chan sessionRequestReq
+	chRemoveConn       chan *ServerConn
+	chAsyncStartWriter chan struct{}
 }
 
 func (ss *ServerSession) initialize() {
@@ -270,14 +274,13 @@ func (ss *ServerSession) initialize() {
 	ss.secretID = secretID
 	ss.ctx = ctx
 	ss.ctxCancel = ctxCancel
-	ss.bytesReceived = new(uint64)
-	ss.bytesSent = new(uint64)
 	ss.conns = make(map[*ServerConn]struct{})
 	ss.lastRequestTime = ss.s.timeNow()
 	ss.udpCheckStreamTimer = emptyTimer()
+
 	ss.chHandleRequest = make(chan sessionRequestReq)
 	ss.chRemoveConn = make(chan *ServerConn)
-	ss.chStartWriter = make(chan struct{})
+	ss.chAsyncStartWriter = make(chan struct{})
 
 	ss.s.wg.Add(1)
 	go ss.run()
@@ -289,13 +292,25 @@ func (ss *ServerSession) Close() {
 }
 
 // BytesReceived returns the number of read bytes.
+//
+// Deprecated: replaced by Stats()
 func (ss *ServerSession) BytesReceived() uint64 {
-	return atomic.LoadUint64(ss.bytesReceived)
+	v := uint64(0)
+	for _, sm := range ss.setuppedMedias {
+		v += atomic.LoadUint64(sm.bytesReceived)
+	}
+	return v
 }
 
 // BytesSent returns the number of written bytes.
+//
+// Deprecated: replaced by Stats()
 func (ss *ServerSession) BytesSent() uint64 {
-	return atomic.LoadUint64(ss.bytesSent)
+	v := uint64(0)
+	for _, sm := range ss.setuppedMedias {
+		v += atomic.LoadUint64(sm.bytesSent)
+	}
+	return v
 }
 
 // State returns the state of the session.
@@ -347,25 +362,193 @@ func (ss *ServerSession) UserData() interface{} {
 	return ss.userData
 }
 
-func (ss *ServerSession) onPacketLost(err error) {
-	if h, ok := ss.s.Handler.(ServerHandlerOnPacketLost); ok {
-		h.OnPacketLost(&ServerHandlerOnPacketLostCtx{
-			Session: ss,
-			Error:   err,
-		})
-	} else {
-		log.Println(err.Error())
-	}
-}
+// Stats returns server session statistics.
+func (ss *ServerSession) Stats() *StatsSession {
+	return &StatsSession{
+		BytesReceived: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.bytesReceived)
+			}
+			return v
+		}(),
+		BytesSent: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.bytesSent)
+			}
+			return v
+		}(),
+		RTPPacketsReceived: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				for _, f := range sm.formats {
+					v += atomic.LoadUint64(f.rtpPacketsReceived)
+				}
+			}
+			return v
+		}(),
+		RTPPacketsSent: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				for _, f := range sm.formats {
+					v += atomic.LoadUint64(f.rtpPacketsSent)
+				}
+			}
+			return v
+		}(),
+		RTPPacketsLost: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				for _, f := range sm.formats {
+					v += atomic.LoadUint64(f.rtpPacketsLost)
+				}
+			}
+			return v
+		}(),
+		RTPPacketsInError: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.rtpPacketsInError)
+			}
+			return v
+		}(),
+		RTPPacketsJitter: func() float64 {
+			v := float64(0)
+			n := float64(0)
+			for _, sm := range ss.setuppedMedias {
+				for _, fo := range sm.formats {
+					if fo.rtcpReceiver != nil {
+						stats := fo.rtcpReceiver.Stats()
+						if stats != nil {
+							v += stats.Jitter
+							n++
+						}
+					}
+				}
+			}
+			if n != 0 {
+				return v / n
+			}
+			return 0
+		}(),
+		RTCPPacketsReceived: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.rtcpPacketsReceived)
+			}
+			return v
+		}(),
+		RTCPPacketsSent: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.rtcpPacketsSent)
+			}
+			return v
+		}(),
+		RTCPPacketsInError: func() uint64 {
+			v := uint64(0)
+			for _, sm := range ss.setuppedMedias {
+				v += atomic.LoadUint64(sm.rtcpPacketsInError)
+			}
+			return v
+		}(),
+		Medias: func() map[*description.Media]StatsSessionMedia { //nolint:dupl
+			ret := make(map[*description.Media]StatsSessionMedia, len(ss.setuppedMedias))
 
-func (ss *ServerSession) onDecodeError(err error) {
-	if h, ok := ss.s.Handler.(ServerHandlerOnDecodeError); ok {
-		h.OnDecodeError(&ServerHandlerOnDecodeErrorCtx{
-			Session: ss,
-			Error:   err,
-		})
-	} else {
-		log.Println(err.Error())
+			for med, sm := range ss.setuppedMedias {
+				ret[med] = StatsSessionMedia{
+					BytesReceived:       atomic.LoadUint64(sm.bytesReceived),
+					BytesSent:           atomic.LoadUint64(sm.bytesSent),
+					RTPPacketsInError:   atomic.LoadUint64(sm.rtpPacketsInError),
+					RTCPPacketsReceived: atomic.LoadUint64(sm.rtcpPacketsReceived),
+					RTCPPacketsSent:     atomic.LoadUint64(sm.rtcpPacketsSent),
+					RTCPPacketsInError:  atomic.LoadUint64(sm.rtcpPacketsInError),
+					Formats: func() map[format.Format]StatsSessionFormat {
+						ret := make(map[format.Format]StatsSessionFormat, len(sm.formats))
+
+						for _, fo := range sm.formats {
+							recvStats := func() *rtcpreceiver.Stats {
+								if fo.rtcpReceiver != nil {
+									return fo.rtcpReceiver.Stats()
+								}
+								return nil
+							}()
+							rtcpSender := func() *rtcpsender.RTCPSender {
+								if ss.setuppedStream != nil {
+									return ss.setuppedStream.medias[med].formats[fo.format.PayloadType()].rtcpSender
+								}
+								return nil
+							}()
+							sentStats := func() *rtcpsender.Stats {
+								if rtcpSender != nil {
+									return rtcpSender.Stats()
+								}
+								return nil
+							}()
+
+							ret[fo.format] = StatsSessionFormat{ //nolint:dupl
+								RTPPacketsReceived: atomic.LoadUint64(fo.rtpPacketsReceived),
+								RTPPacketsSent:     atomic.LoadUint64(fo.rtpPacketsSent),
+								RTPPacketsLost:     atomic.LoadUint64(fo.rtpPacketsLost),
+								LocalSSRC: func() uint32 {
+									if fo.rtcpReceiver != nil {
+										return *fo.rtcpReceiver.LocalSSRC
+									}
+									if sentStats != nil {
+										return sentStats.LocalSSRC
+									}
+									return 0
+								}(),
+								RemoteSSRC: func() uint32 {
+									if recvStats != nil {
+										return recvStats.RemoteSSRC
+									}
+									return 0
+								}(),
+								RTPPacketsLastSequenceNumber: func() uint16 {
+									if recvStats != nil {
+										return recvStats.LastSequenceNumber
+									}
+									if sentStats != nil {
+										return sentStats.LastSequenceNumber
+									}
+									return 0
+								}(),
+								RTPPacketsLastRTP: func() uint32 {
+									if recvStats != nil {
+										return recvStats.LastRTP
+									}
+									if sentStats != nil {
+										return sentStats.LastRTP
+									}
+									return 0
+								}(),
+								RTPPacketsLastNTP: func() time.Time {
+									if recvStats != nil {
+										return recvStats.LastNTP
+									}
+									if sentStats != nil {
+										return sentStats.LastNTP
+									}
+									return time.Time{}
+								}(),
+								RTPPacketsJitter: func() float64 {
+									if recvStats != nil {
+										return recvStats.Jitter
+									}
+									return 0
+								}(),
+							}
+						}
+
+						return ret
+					}(),
+				}
+			}
+
+			return ret
+		}(),
 	}
 }
 
@@ -392,6 +575,39 @@ func (ss *ServerSession) checkState(allowed map[ServerSessionState]struct{}) err
 		i++
 	}
 	return liberrors.ErrServerInvalidState{AllowedList: allowedList, State: ss.state}
+}
+
+func (ss *ServerSession) createWriter() {
+	ss.writerMutex.Lock()
+
+	ss.writer = &asyncProcessor{
+		bufferSize: func() int {
+			if ss.state == ServerSessionStatePrePlay {
+				return ss.s.WriteQueueSize
+			}
+
+			// when recording, writeBuffer is only used to send RTCP receiver reports,
+			// that are much smaller than RTP packets and are sent at a fixed interval.
+			// decrease RAM consumption by allocating less buffers.
+			return 8
+		}(),
+	}
+
+	ss.writer.initialize()
+
+	ss.writerMutex.Unlock()
+}
+
+func (ss *ServerSession) startWriter() {
+	ss.writer.start()
+}
+
+func (ss *ServerSession) destroyWriter() {
+	ss.writer.close()
+
+	ss.writerMutex.Lock()
+	ss.writer = nil
+	ss.writerMutex.Unlock()
 }
 
 func (ss *ServerSession) run() {
@@ -425,10 +641,12 @@ func (ss *ServerSession) run() {
 		ss.setuppedStream.readerRemove(ss)
 	}
 
-	ss.writer.stop()
-
 	for _, sm := range ss.setuppedMedias {
 		sm.stop()
+	}
+
+	if ss.writer != nil {
+		ss.destroyWriter()
 	}
 
 	ss.s.closeSession(ss)
@@ -443,6 +661,13 @@ func (ss *ServerSession) run() {
 
 func (ss *ServerSession) runInner() error {
 	for {
+		chWriterError := func() chan struct{} {
+			if ss.writer != nil {
+				return ss.writer.chStopped
+			}
+			return nil
+		}()
+
 		select {
 		case req := <-ss.chHandleRequest:
 			ss.lastRequestTime = ss.s.timeNow()
@@ -513,11 +738,11 @@ func (ss *ServerSession) runInner() error {
 				return liberrors.ErrServerSessionNotInUse{}
 			}
 
-		case <-ss.chStartWriter:
+		case <-ss.chAsyncStartWriter:
 			if (ss.state == ServerSessionStateRecord ||
 				ss.state == ServerSessionStatePlay) &&
 				*ss.setuppedTransport == TransportTCP {
-				ss.writer.start()
+				ss.startWriter()
 			}
 
 		case <-ss.udpCheckStreamTimer.C:
@@ -538,6 +763,9 @@ func (ss *ServerSession) runInner() error {
 			}
 
 			ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
+
+		case <-chWriterError:
+			return ss.writer.stopError
 
 		case <-ss.ctx.Done():
 			return liberrors.ErrServerTerminated{}
@@ -644,14 +872,12 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			Description: &desc,
 		})
 
-		if res.StatusCode != base.StatusOK {
-			return res, err
+		if res.StatusCode == base.StatusOK {
+			ss.state = ServerSessionStatePreRecord
+			ss.setuppedPath = path
+			ss.setuppedQuery = query
+			ss.announcedDesc = &desc
 		}
-
-		ss.state = ServerSessionStatePreRecord
-		ss.setuppedPath = path
-		ss.setuppedQuery = query
-		ss.announcedDesc = &desc
 
 		return res, err
 
@@ -789,121 +1015,132 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			}
 		}
 
-		if res.StatusCode != base.StatusOK {
-			return res, err
+		if ss.state == ServerSessionStatePreRecord && stream != nil {
+			panic("stream must be nil when handling publishers")
 		}
 
-		var medi *description.Media
-		switch ss.state {
-		case ServerSessionStateInitial, ServerSessionStatePrePlay: // play
-			medi = findMediaByTrackID(stream.desc.Medias, trackID)
-		default: // record
-			medi = findMediaByURL(ss.announcedDesc.Medias, path, query, req.URL)
-		}
+		if res.StatusCode == base.StatusOK {
+			var medi *description.Media
 
-		if medi == nil {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, liberrors.ErrServerMediaNotFound{}
-		}
+			switch ss.state {
+			case ServerSessionStateInitial, ServerSessionStatePrePlay: // play
+				if stream == nil {
+					panic("stream cannot be nil when StatusCode is StatusOK")
+				}
 
-		if _, ok := ss.setuppedMedias[medi]; ok {
-			return &base.Response{
-				StatusCode: base.StatusBadRequest,
-			}, liberrors.ErrServerMediaAlreadySetup{}
-		}
+				medi = findMediaByTrackID(stream.Desc.Medias, trackID)
+			default: // record
+				medi = findMediaByURL(ss.announcedDesc.Medias, path, query, req.URL)
+			}
 
-		ss.setuppedTransport = &transport
-
-		if ss.state == ServerSessionStateInitial {
-			err = stream.readerAdd(ss,
-				inTH.ClientPorts,
-			)
-			if err != nil {
+			if medi == nil {
 				return &base.Response{
 					StatusCode: base.StatusBadRequest,
-				}, err
+				}, liberrors.ErrServerMediaNotFound{}
 			}
 
-			ss.state = ServerSessionStatePrePlay
-			ss.setuppedPath = path
-			ss.setuppedQuery = query
-			ss.setuppedStream = stream
-		}
-
-		th := headers.Transport{}
-
-		if ss.state == ServerSessionStatePrePlay {
-			ssrc, ok := stream.senderSSRC(medi)
-			if ok {
-				th.SSRC = &ssrc
-			}
-		}
-
-		if res.Header == nil {
-			res.Header = make(base.Header)
-		}
-
-		sm := &serverSessionMedia{
-			ss:           ss,
-			media:        medi,
-			onPacketRTCP: func(_ rtcp.Packet) {},
-		}
-		sm.initialize()
-
-		switch transport {
-		case TransportUDP:
-			sm.udpRTPReadPort = inTH.ClientPorts[0]
-			sm.udpRTCPReadPort = inTH.ClientPorts[1]
-
-			sm.udpRTPWriteAddr = &net.UDPAddr{
-				IP:   ss.author.ip(),
-				Zone: ss.author.zone(),
-				Port: sm.udpRTPReadPort,
+			if _, ok := ss.setuppedMedias[medi]; ok {
+				return &base.Response{
+					StatusCode: base.StatusBadRequest,
+				}, liberrors.ErrServerMediaAlreadySetup{}
 			}
 
-			sm.udpRTCPWriteAddr = &net.UDPAddr{
-				IP:   ss.author.ip(),
-				Zone: ss.author.zone(),
-				Port: sm.udpRTCPReadPort,
+			ss.setuppedTransport = &transport
+
+			if ss.state == ServerSessionStateInitial {
+				err = stream.readerAdd(ss,
+					inTH.ClientPorts,
+				)
+				if err != nil {
+					return &base.Response{
+						StatusCode: base.StatusBadRequest,
+					}, err
+				}
+
+				ss.state = ServerSessionStatePrePlay
+				ss.setuppedPath = path
+				ss.setuppedQuery = query
+				ss.setuppedStream = stream
 			}
 
-			th.Protocol = headers.TransportProtocolUDP
-			de := headers.TransportDeliveryUnicast
-			th.Delivery = &de
-			th.ClientPorts = inTH.ClientPorts
-			th.ServerPorts = &[2]int{sc.s.udpRTPListener.port(), sc.s.udpRTCPListener.port()}
+			th := headers.Transport{}
 
-		case TransportUDPMulticast:
-			th.Protocol = headers.TransportProtocolUDP
-			de := headers.TransportDeliveryMulticast
-			th.Delivery = &de
-			v := uint(127)
-			th.TTL = &v
-			d := stream.streamMedias[medi].multicastWriter.ip()
-			th.Destination = &d
-			th.Ports = &[2]int{ss.s.MulticastRTPPort, ss.s.MulticastRTCPPort}
+			if ss.state == ServerSessionStatePrePlay {
+				if stream != ss.setuppedStream {
+					panic("stream cannot be different than the one returned in previous OnSetup call")
+				}
 
-		default: // TCP
-			if inTH.InterleavedIDs != nil {
-				sm.tcpChannel = inTH.InterleavedIDs[0]
-			} else {
-				sm.tcpChannel = ss.findFreeChannelPair()
+				ssrc, ok := stream.localSSRC(medi)
+				if ok {
+					th.SSRC = &ssrc
+				}
 			}
 
-			th.Protocol = headers.TransportProtocolTCP
-			de := headers.TransportDeliveryUnicast
-			th.Delivery = &de
-			th.InterleavedIDs = &[2]int{sm.tcpChannel, sm.tcpChannel + 1}
-		}
+			if res.Header == nil {
+				res.Header = make(base.Header)
+			}
 
-		if ss.setuppedMedias == nil {
-			ss.setuppedMedias = make(map[*description.Media]*serverSessionMedia)
-		}
-		ss.setuppedMedias[medi] = sm
-		ss.setuppedMediasOrdered = append(ss.setuppedMediasOrdered, sm)
+			sm := &serverSessionMedia{
+				ss:           ss,
+				media:        medi,
+				onPacketRTCP: func(_ rtcp.Packet) {},
+			}
+			sm.initialize()
 
-		res.Header["Transport"] = th.Marshal()
+			switch transport {
+			case TransportUDP:
+				sm.udpRTPReadPort = inTH.ClientPorts[0]
+				sm.udpRTCPReadPort = inTH.ClientPorts[1]
+
+				sm.udpRTPWriteAddr = &net.UDPAddr{
+					IP:   ss.author.ip(),
+					Zone: ss.author.zone(),
+					Port: sm.udpRTPReadPort,
+				}
+
+				sm.udpRTCPWriteAddr = &net.UDPAddr{
+					IP:   ss.author.ip(),
+					Zone: ss.author.zone(),
+					Port: sm.udpRTCPReadPort,
+				}
+
+				th.Protocol = headers.TransportProtocolUDP
+				de := headers.TransportDeliveryUnicast
+				th.Delivery = &de
+				th.ClientPorts = inTH.ClientPorts
+				th.ServerPorts = &[2]int{sc.s.udpRTPListener.port(), sc.s.udpRTCPListener.port()}
+
+			case TransportUDPMulticast:
+				th.Protocol = headers.TransportProtocolUDP
+				de := headers.TransportDeliveryMulticast
+				th.Delivery = &de
+				v := uint(127)
+				th.TTL = &v
+				d := stream.medias[medi].multicastWriter.ip()
+				th.Destination = &d
+				th.Ports = &[2]int{ss.s.MulticastRTPPort, ss.s.MulticastRTCPPort}
+
+			default: // TCP
+				if inTH.InterleavedIDs != nil {
+					sm.tcpChannel = inTH.InterleavedIDs[0]
+				} else {
+					sm.tcpChannel = ss.findFreeChannelPair()
+				}
+
+				th.Protocol = headers.TransportProtocolTCP
+				de := headers.TransportDeliveryUnicast
+				th.Delivery = &de
+				th.InterleavedIDs = &[2]int{sm.tcpChannel, sm.tcpChannel + 1}
+			}
+
+			if ss.setuppedMedias == nil {
+				ss.setuppedMedias = make(map[*description.Media]*serverSessionMedia)
+			}
+			ss.setuppedMedias[medi] = sm
+			ss.setuppedMediasOrdered = append(ss.setuppedMediasOrdered, sm)
+
+			res.Header["Transport"] = th.Marshal()
+		}
 
 		return res, err
 
@@ -925,12 +1162,9 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			}, liberrors.ErrServerPathHasChanged{Prev: ss.setuppedPath, Cur: path}
 		}
 
-		// allocate writeBuffer before calling OnPlay().
-		// in this way it's possible to call ServerSession.WritePacket*()
-		// inside the callback.
 		if ss.state != ServerSessionStatePlay &&
 			*ss.setuppedTransport != TransportUDPMulticast {
-			ss.writer.allocateBuffer(ss.s.WriteQueueSize)
+			ss.createWriter()
 		}
 
 		res, err := sc.s.Handler.(ServerHandlerOnPlay).OnPlay(&ServerHandlerOnPlayCtx{
@@ -941,56 +1175,61 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			Query:   query,
 		})
 
-		if res.StatusCode != base.StatusOK {
+		if res.StatusCode == base.StatusOK {
 			if ss.state != ServerSessionStatePlay {
-				ss.writer.buffer = nil
+				ss.state = ServerSessionStatePlay
+
+				v := ss.s.timeNow().Unix()
+				ss.udpLastPacketTime = &v
+
+				ss.timeDecoder = &rtptime.GlobalDecoder2{}
+				ss.timeDecoder.Initialize()
+
+				for _, sm := range ss.setuppedMedias {
+					sm.start()
+				}
+
+				if *ss.setuppedTransport == TransportTCP {
+					ss.tcpFrame = &base.InterleavedFrame{}
+					ss.tcpBuffer = make([]byte, ss.s.MaxPacketSize+4)
+				}
+
+				switch *ss.setuppedTransport {
+				case TransportUDP:
+					ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
+					ss.startWriter()
+
+				case TransportUDPMulticast:
+					ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
+
+				default: // TCP
+					ss.tcpConn = sc
+					err = switchReadFuncError{true}
+					// startWriter() is called by ServerConn, through chAsyncStartWriter,
+					// after the response has been sent
+				}
+
+				ss.setuppedStream.readerSetActive(ss)
+
+				rtpInfo, ok := generateRTPInfo(
+					ss.s.timeNow(),
+					ss.setuppedMediasOrdered,
+					ss.setuppedStream,
+					ss.setuppedPath,
+					req.URL)
+
+				if ok {
+					if res.Header == nil {
+						res.Header = make(base.Header)
+					}
+					res.Header["RTP-Info"] = rtpInfo.Marshal()
+				}
 			}
-			return res, err
-		}
-
-		if ss.state == ServerSessionStatePlay {
-			return res, err
-		}
-
-		ss.state = ServerSessionStatePlay
-
-		v := ss.s.timeNow().Unix()
-		ss.udpLastPacketTime = &v
-
-		ss.timeDecoder = rtptime.NewGlobalDecoder2()
-
-		for _, sm := range ss.setuppedMedias {
-			sm.start()
-		}
-
-		switch *ss.setuppedTransport {
-		case TransportUDP:
-			ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
-			ss.writer.start()
-
-		case TransportUDPMulticast:
-			ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
-
-		default: // TCP
-			ss.tcpConn = sc
-			err = switchReadFuncError{true}
-			// writer.start() is called by ServerConn after the response has been sent
-		}
-
-		ss.setuppedStream.readerSetActive(ss)
-
-		rtpInfo, ok := generateRTPInfo(
-			ss.s.timeNow(),
-			ss.setuppedMediasOrdered,
-			ss.setuppedStream,
-			ss.setuppedPath,
-			req.URL)
-
-		if ok {
-			if res.Header == nil {
-				res.Header = make(base.Header)
+		} else {
+			if ss.state != ServerSessionStatePlay &&
+				*ss.setuppedTransport != TransportUDPMulticast {
+				ss.destroyWriter()
 			}
-			res.Header["RTP-Info"] = rtpInfo.Marshal()
 		}
 
 		return res, err
@@ -1017,13 +1256,7 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			}, liberrors.ErrServerPathHasChanged{Prev: ss.setuppedPath, Cur: path}
 		}
 
-		// allocate writeBuffer before calling OnRecord().
-		// in this way it's possible to call ServerSession.WritePacket*()
-		// inside the callback.
-		// when recording, writeBuffer is only used to send RTCP receiver reports,
-		// that are much smaller than RTP packets and are sent at a fixed interval.
-		// decrease RAM consumption by allocating less buffers.
-		ss.writer.allocateBuffer(8)
+		ss.createWriter()
 
 		res, err := ss.s.Handler.(ServerHandlerOnRecord).OnRecord(&ServerHandlerOnRecordCtx{
 			Session: ss,
@@ -1033,31 +1266,37 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			Query:   query,
 		})
 
-		if res.StatusCode != base.StatusOK {
-			ss.writer.buffer = nil
-			return res, err
-		}
+		if res.StatusCode == base.StatusOK {
+			ss.state = ServerSessionStateRecord
 
-		ss.state = ServerSessionStateRecord
+			v := ss.s.timeNow().Unix()
+			ss.udpLastPacketTime = &v
 
-		v := ss.s.timeNow().Unix()
-		ss.udpLastPacketTime = &v
+			ss.timeDecoder = &rtptime.GlobalDecoder2{}
+			ss.timeDecoder.Initialize()
 
-		ss.timeDecoder = rtptime.NewGlobalDecoder2()
+			for _, sm := range ss.setuppedMedias {
+				sm.start()
+			}
 
-		for _, sm := range ss.setuppedMedias {
-			sm.start()
-		}
+			if *ss.setuppedTransport == TransportTCP {
+				ss.tcpFrame = &base.InterleavedFrame{}
+				ss.tcpBuffer = make([]byte, ss.s.MaxPacketSize+4)
+			}
 
-		switch *ss.setuppedTransport {
-		case TransportUDP:
-			ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
-			ss.writer.start()
+			switch *ss.setuppedTransport {
+			case TransportUDP:
+				ss.udpCheckStreamTimer = time.NewTimer(ss.s.checkStreamPeriod)
+				ss.startWriter()
 
-		default: // TCP
-			ss.tcpConn = sc
-			err = switchReadFuncError{true}
-			// runWriter() is called by conn after sending the response
+			default: // TCP
+				ss.tcpConn = sc
+				err = switchReadFuncError{true}
+				// startWriter() is called by ServerConn, through chAsyncStartWriter,
+				// after the response has been sent
+			}
+		} else {
+			ss.destroyWriter()
 		}
 
 		return res, err
@@ -1083,49 +1322,49 @@ func (ss *ServerSession) handleRequestInner(sc *ServerConn, req *base.Request) (
 			Query:   query,
 		})
 
-		if res.StatusCode != base.StatusOK {
-			return res, err
-		}
+		if res.StatusCode == base.StatusOK {
+			if ss.state == ServerSessionStatePlay || ss.state == ServerSessionStateRecord {
+				ss.destroyWriter()
 
-		if ss.setuppedStream != nil {
-			ss.setuppedStream.readerSetInactive(ss)
-		}
+				if ss.setuppedStream != nil {
+					ss.setuppedStream.readerSetInactive(ss)
+				}
 
-		ss.writer.stop()
+				for _, sm := range ss.setuppedMedias {
+					sm.stop()
+				}
 
-		for _, sm := range ss.setuppedMedias {
-			sm.stop()
-		}
+				ss.timeDecoder = nil
 
-		ss.timeDecoder = nil
+				switch ss.state {
+				case ServerSessionStatePlay:
+					ss.state = ServerSessionStatePrePlay
 
-		switch ss.state {
-		case ServerSessionStatePlay:
-			ss.state = ServerSessionStatePrePlay
+					switch *ss.setuppedTransport {
+					case TransportUDP:
+						ss.udpCheckStreamTimer = emptyTimer()
 
-			switch *ss.setuppedTransport {
-			case TransportUDP:
-				ss.udpCheckStreamTimer = emptyTimer()
+					case TransportUDPMulticast:
+						ss.udpCheckStreamTimer = emptyTimer()
 
-			case TransportUDPMulticast:
-				ss.udpCheckStreamTimer = emptyTimer()
+					default: // TCP
+						err = switchReadFuncError{false}
+						ss.tcpConn = nil
+					}
 
-			default: // TCP
-				err = switchReadFuncError{false}
-				ss.tcpConn = nil
+				case ServerSessionStateRecord:
+					switch *ss.setuppedTransport {
+					case TransportUDP:
+						ss.udpCheckStreamTimer = emptyTimer()
+
+					default: // TCP
+						err = switchReadFuncError{false}
+						ss.tcpConn = nil
+					}
+
+					ss.state = ServerSessionStatePreRecord
+				}
 			}
-
-		case ServerSessionStateRecord:
-			switch *ss.setuppedTransport {
-			case TransportUDP:
-				ss.udpCheckStreamTimer = emptyTimer()
-
-			default: // TCP
-				err = switchReadFuncError{false}
-				ss.tcpConn = nil
-			}
-
-			ss.state = ServerSessionStatePreRecord
 		}
 
 		return res, err
@@ -1196,7 +1435,7 @@ func (ss *ServerSession) findFreeChannelPair() int {
 	}
 }
 
-// OnPacketRTPAny sets the callback that is called when a RTP packet is read from any setupped media.
+// OnPacketRTPAny sets a callback that is called when a RTP packet is read from any setupped media.
 func (ss *ServerSession) OnPacketRTPAny(cb OnPacketRTPAnyFunc) {
 	for _, sm := range ss.setuppedMedias {
 		cmedia := sm.media
@@ -1208,7 +1447,7 @@ func (ss *ServerSession) OnPacketRTPAny(cb OnPacketRTPAnyFunc) {
 	}
 }
 
-// OnPacketRTCPAny sets the callback that is called when a RTCP packet is read from any setupped media.
+// OnPacketRTCPAny sets a callback that is called when a RTCP packet is read from any setupped media.
 func (ss *ServerSession) OnPacketRTCPAny(cb OnPacketRTCPAnyFunc) {
 	for _, sm := range ss.setuppedMedias {
 		cmedia := sm.media
@@ -1218,22 +1457,38 @@ func (ss *ServerSession) OnPacketRTCPAny(cb OnPacketRTCPAnyFunc) {
 	}
 }
 
-// OnPacketRTP sets the callback that is called when a RTP packet is read.
+// OnPacketRTP sets a callback that is called when a RTP packet is read.
 func (ss *ServerSession) OnPacketRTP(medi *description.Media, forma format.Format, cb OnPacketRTPFunc) {
 	sm := ss.setuppedMedias[medi]
 	st := sm.formats[forma.PayloadType()]
 	st.onPacketRTP = cb
 }
 
-// OnPacketRTCP sets the callback that is called when a RTCP packet is read.
+// OnPacketRTCP sets a callback that is called when a RTCP packet is read.
 func (ss *ServerSession) OnPacketRTCP(medi *description.Media, cb OnPacketRTCPFunc) {
 	sm := ss.setuppedMedias[medi]
 	sm.onPacketRTCP = cb
 }
 
-func (ss *ServerSession) writePacketRTP(medi *description.Media, byts []byte) error {
+func (ss *ServerSession) writePacketRTP(medi *description.Media, payloadType uint8, byts []byte) error {
 	sm := ss.setuppedMedias[medi]
-	return sm.writePacketRTP(byts)
+	sf := sm.formats[payloadType]
+
+	ss.writerMutex.RLock()
+	defer ss.writerMutex.RUnlock()
+
+	if ss.writer == nil {
+		return nil
+	}
+
+	ok := ss.writer.push(func() error {
+		return sf.writePacketRTPInQueue(byts)
+	})
+	if !ok {
+		return liberrors.ErrServerWriteQueueFull{}
+	}
+
+	return nil
 }
 
 // WritePacketRTP writes a RTP packet to the session.
@@ -1245,12 +1500,27 @@ func (ss *ServerSession) WritePacketRTP(medi *description.Media, pkt *rtp.Packet
 	}
 	byts = byts[:n]
 
-	return ss.writePacketRTP(medi, byts)
+	return ss.writePacketRTP(medi, pkt.PayloadType, byts)
 }
 
 func (ss *ServerSession) writePacketRTCP(medi *description.Media, byts []byte) error {
 	sm := ss.setuppedMedias[medi]
-	return sm.writePacketRTCP(byts)
+
+	ss.writerMutex.RLock()
+	defer ss.writerMutex.RUnlock()
+
+	if ss.writer == nil {
+		return nil
+	}
+
+	ok := ss.writer.push(func() error {
+		return sm.writePacketRTCPInQueue(byts)
+	})
+	if !ok {
+		return liberrors.ErrServerWriteQueueFull{}
+	}
+
+	return nil
 }
 
 // WritePacketRTCP writes a RTCP packet to the session.
@@ -1315,9 +1585,9 @@ func (ss *ServerSession) removeConn(sc *ServerConn) {
 	}
 }
 
-func (ss *ServerSession) startWriter() {
+func (ss *ServerSession) asyncStartWriter() {
 	select {
-	case ss.chStartWriter <- struct{}{}:
+	case ss.chAsyncStartWriter <- struct{}{}:
 	case <-ss.ctx.Done():
 	}
 }

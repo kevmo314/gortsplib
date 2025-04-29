@@ -7,7 +7,7 @@ import (
 
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 )
 
 // ErrMorePacketsNeeded is returned when more packets are needed.
@@ -38,6 +38,14 @@ func isAllZero(buf []byte) bool {
 	return true
 }
 
+func auSize(au [][]byte) int {
+	s := 0
+	for _, nalu := range au {
+		s += len(nalu)
+	}
+	return s
+}
+
 // Decoder is a RTP/H264 decoder.
 // Specification: https://datatracker.ietf.org/doc/html/rfc6184
 type Decoder struct {
@@ -51,9 +59,10 @@ type Decoder struct {
 	annexBMode          bool
 
 	// for Decode()
-	frameBuffer     [][]byte
-	frameBufferLen  int
-	frameBufferSize int
+	frameBuffer          [][]byte
+	frameBufferLen       int
+	frameBufferSize      int
+	frameBufferTimestamp uint32
 }
 
 // Init initializes the decoder.
@@ -130,8 +139,10 @@ func (d *Decoder) decodeNALUs(pkt *rtp.Packet) ([][]byte, error) {
 		d.fragmentsSize += len(pkt.Payload[2:])
 
 		if d.fragmentsSize > h264.MaxAccessUnitSize {
+			errSize := d.fragmentsSize
 			d.resetFragments()
-			return nil, fmt.Errorf("NALU size (%d) is too big, maximum is %d", d.fragmentsSize, h264.MaxAccessUnitSize)
+			return nil, fmt.Errorf("NALU size (%d) is too big, maximum is %d",
+				errSize, h264.MaxAccessUnitSize)
 		}
 
 		d.fragments = append(d.fragments, pkt.Payload[2:])
@@ -157,9 +168,13 @@ func (d *Decoder) decodeNALUs(pkt *rtp.Packet) ([][]byte, error) {
 			size := uint16(payload[0])<<8 | uint16(payload[1])
 			payload = payload[2:]
 
-			// discard padding
-			if size == 0 && isAllZero(payload) {
-				break
+			if size == 0 {
+				// discard padding
+				if isAllZero(payload) {
+					break
+				}
+
+				return nil, fmt.Errorf("invalid STAP-A packet (invalid size)")
 			}
 
 			if int(size) > len(payload) {
@@ -208,44 +223,63 @@ func (d *Decoder) Decode(pkt *rtp.Packet) ([][]byte, error) {
 	}
 	l := len(nalus)
 
-	if (d.frameBufferLen + l) > h264.MaxNALUsPerAccessUnit {
-		d.frameBuffer = nil
-		d.frameBufferLen = 0
-		d.frameBufferSize = 0
-		return nil, fmt.Errorf("NALU count exceeds maximum allowed (%d)",
-			h264.MaxNALUsPerAccessUnit)
+	// support splitting access units by timestamp.
+	// (some cameras do not use the Marker field, like the FLIR M400)
+	if d.frameBuffer != nil && pkt.Timestamp != d.frameBufferTimestamp {
+		ret := d.frameBuffer
+		d.resetFrameBuffer()
+
+		err = d.addToFrameBuffer(nalus, l, pkt.Timestamp)
+		if err != nil {
+			return nil, err
+		}
+
+		return ret, nil
 	}
 
-	addSize := 0
-
-	for _, nalu := range nalus {
-		addSize += len(nalu)
+	err = d.addToFrameBuffer(nalus, l, pkt.Timestamp)
+	if err != nil {
+		return nil, err
 	}
-
-	if (d.frameBufferSize + addSize) > h264.MaxAccessUnitSize {
-		d.frameBuffer = nil
-		d.frameBufferLen = 0
-		d.frameBufferSize = 0
-		return nil, fmt.Errorf("access unit size (%d) is too big, maximum is %d",
-			d.frameBufferSize+addSize, h264.MaxAccessUnitSize)
-	}
-
-	d.frameBuffer = append(d.frameBuffer, nalus...)
-	d.frameBufferLen += l
-	d.frameBufferSize += addSize
 
 	if !pkt.Marker {
 		return nil, ErrMorePacketsNeeded
 	}
 
 	ret := d.frameBuffer
-
-	// do not reuse frameBuffer to avoid race conditions
-	d.frameBuffer = nil
-	d.frameBufferLen = 0
-	d.frameBufferSize = 0
+	d.resetFrameBuffer()
 
 	return ret, nil
+}
+
+func (d *Decoder) resetFrameBuffer() {
+	d.frameBuffer = nil // do not reuse frameBuffer to avoid race conditions
+	d.frameBufferLen = 0
+	d.frameBufferSize = 0
+}
+
+func (d *Decoder) addToFrameBuffer(nalus [][]byte, l int, ts uint32) error {
+	if (d.frameBufferLen + l) > h264.MaxNALUsPerAccessUnit {
+		errCount := d.frameBufferLen + l
+		d.resetFrameBuffer()
+		return fmt.Errorf("NALU count (%d) exceeds maximum allowed (%d)",
+			errCount, h264.MaxNALUsPerAccessUnit)
+	}
+
+	addSize := auSize(nalus)
+
+	if (d.frameBufferSize + addSize) > h264.MaxAccessUnitSize {
+		errSize := d.frameBufferSize + addSize
+		d.resetFrameBuffer()
+		return fmt.Errorf("access unit size (%d) is too big, maximum is %d",
+			errSize, h264.MaxAccessUnitSize)
+	}
+
+	d.frameBuffer = append(d.frameBuffer, nalus...)
+	d.frameBufferLen += l
+	d.frameBufferSize += addSize
+	d.frameBufferTimestamp = ts
+	return nil
 }
 
 // some cameras / servers wrap NALUs into Annex-B
@@ -262,7 +296,9 @@ func (d *Decoder) removeAnnexB(nalus [][]byte) ([][]byte, error) {
 				nalu = append([]byte{0x00, 0x00, 0x00, 0x01}, nalu...)
 			}
 
-			return h264.AnnexBUnmarshal(nalu)
+			var annexb h264.AnnexB
+			err := annexb.Unmarshal(nalu)
+			return annexb, err
 		}
 	}
 

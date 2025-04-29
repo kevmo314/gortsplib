@@ -6,7 +6,7 @@ import (
 
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4video"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4video"
 )
 
 // ErrMorePacketsNeeded is returned when more packets are needed.
@@ -61,8 +61,10 @@ func (d *Decoder) Decode(pkt *rtp.Packet) ([]byte, error) {
 		d.fragmentsSize += len(pkt.Payload)
 
 		if d.fragmentsSize > mpeg4video.MaxFrameSize {
+			errSize := d.fragmentsSize
 			d.resetFragments()
-			return nil, fmt.Errorf("frame size (%d) is too big, maximum is %d", d.fragmentsSize, mpeg4video.MaxFrameSize)
+			return nil, fmt.Errorf("frame size (%d) is too big, maximum is %d",
+				errSize, mpeg4video.MaxFrameSize)
 		}
 
 		d.fragments = append(d.fragments, pkt.Payload)

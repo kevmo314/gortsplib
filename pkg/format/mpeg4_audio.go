@@ -6,7 +6,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/pion/rtp"
 
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtpmpeg4audio"
@@ -51,7 +51,7 @@ func (f *MPEG4Audio) unmarshal(ctx *unmarshalContext) error {
 				}
 
 			case "mode":
-				if strings.ToLower(val) != "aac-hbr" {
+				if strings.ToLower(val) != "aac-hbr" && strings.ToLower(val) != "aac_hbr" {
 					return fmt.Errorf("unsupported AAC mode: %v", val)
 				}
 

@@ -292,8 +292,13 @@ func TestServerRecordPath(t *testing.T) {
 			s = &Server{
 				Handler: &testServerHandler{
 					onAnnounce: func(ctx *ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-						// make sure that media URLs are not overridden by NewServerStream()
-						stream := NewServerStream(s, ctx.Description)
+						// make sure that media URLs are not overridden by ServerStream.Initialize()
+						stream := &ServerStream{
+							Server: s,
+							Desc:   ctx.Description,
+						}
+						err := stream.Initialize()
+						require.NoError(t, err)
 						defer stream.Close()
 
 						return &base.Response{
@@ -544,13 +549,25 @@ func TestServerRecord(t *testing.T) {
 					onConnOpen: func(_ *ServerHandlerOnConnOpenCtx) {
 						close(nconnOpened)
 					},
-					onConnClose: func(_ *ServerHandlerOnConnCloseCtx) {
+					onConnClose: func(ctx *ServerHandlerOnConnCloseCtx) {
+						s := ctx.Conn.Stats()
+						require.Greater(t, s.BytesSent, uint64(510))
+						require.Less(t, s.BytesSent, uint64(560))
+						require.Greater(t, s.BytesReceived, uint64(1000))
+						require.Less(t, s.BytesReceived, uint64(1200))
+
 						close(nconnClosed)
 					},
 					onSessionOpen: func(_ *ServerHandlerOnSessionOpenCtx) {
 						close(sessionOpened)
 					},
-					onSessionClose: func(_ *ServerHandlerOnSessionCloseCtx) {
+					onSessionClose: func(ctx *ServerHandlerOnSessionCloseCtx) {
+						s := ctx.Session.Stats()
+						require.Greater(t, s.BytesSent, uint64(75))
+						require.Less(t, s.BytesSent, uint64(130))
+						require.Greater(t, s.BytesReceived, uint64(70))
+						require.Less(t, s.BytesReceived, uint64(80))
+
 						close(sessionClosed)
 					},
 					onAnnounce: func(_ *ServerHandlerOnAnnounceCtx) (*base.Response, error) {
@@ -703,6 +720,13 @@ func TestServerRecord(t *testing.T) {
 			doRecord(t, conn, "rtsp://localhost:8554/teststream", session)
 
 			for i := 0; i < 2; i++ {
+				// skip firewall opening
+				if transport == "udp" {
+					buf := make([]byte, 2048)
+					_, _, err = l2s[i].ReadFrom(buf)
+					require.NoError(t, err)
+				}
+
 				// server -> client (direct)
 				if transport == "udp" {
 					buf := make([]byte, 2048)
@@ -716,13 +740,6 @@ func TestServerRecord(t *testing.T) {
 					require.NoError(t, err)
 					require.Equal(t, 3+i*2, f.Channel)
 					require.Equal(t, testRTCPPacketMarshaled, f.Payload)
-				}
-
-				// skip firewall opening
-				if transport == "udp" {
-					buf := make([]byte, 2048)
-					_, _, err = l2s[i].ReadFrom(buf)
-					require.NoError(t, err)
 				}
 
 				// client -> server
@@ -1242,8 +1259,8 @@ func TestServerRecordDecodeErrors(t *testing.T) {
 							StatusCode: base.StatusOK,
 						}, nil
 					},
-					onPacketLost: func(ctx *ServerHandlerOnPacketLostCtx) {
-						require.EqualError(t, ctx.Error, "69 RTP packets lost")
+					onPacketsLost: func(ctx *ServerHandlerOnPacketsLostCtx) {
+						require.Equal(t, uint64(69), ctx.Lost)
 						close(errorRecv)
 					},
 					onDecodeError: func(ctx *ServerHandlerOnDecodeErrorCtx) {

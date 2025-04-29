@@ -9,22 +9,23 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/format/rtph265"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 	"github.com/pion/rtp"
 )
 
 // This example shows how to
 // 1. connect to a RTSP server
-// 2. check if there's an H265 format
-// 3. decode the H265 format into RGBA frames
+// 2. check if there's a H265 stream
+// 3. decode the H265 stream into RGBA frames
 
 // This example requires the FFmpeg libraries, that can be installed with this command:
-// apt install -y libavformat-dev libswscale-dev gcc pkg-config
+// apt install -y libavcodec-dev libswscale-dev gcc pkg-config
 
 func main() {
 	c := gortsplib.Client{}
 
 	// parse URL
-	u, err := base.ParseURL("rtsp://localhost:8554/mystream")
+	u, err := base.ParseURL("rtsp://myuser:mypass@localhost:8554/mystream")
 	if err != nil {
 		panic(err)
 	}
@@ -55,23 +56,23 @@ func main() {
 		panic(err)
 	}
 
-	// setup H265 -> raw frames decoder
-	frameDec := &h265Decoder{}
-	err = frameDec.initialize()
+	// setup H265 -> RGBA decoder
+	h265Dec := &h265Decoder{}
+	err = h265Dec.initialize()
 	if err != nil {
 		panic(err)
 	}
-	defer frameDec.close()
+	defer h265Dec.close()
 
 	// if VPS, SPS and PPS are present into the SDP, send them to the decoder
 	if forma.VPS != nil {
-		frameDec.decode(forma.VPS)
+		h265Dec.decode([][]byte{forma.VPS})
 	}
 	if forma.SPS != nil {
-		frameDec.decode(forma.SPS)
+		h265Dec.decode([][]byte{forma.SPS})
 	}
 	if forma.PPS != nil {
-		frameDec.decode(forma.PPS)
+		h265Dec.decode([][]byte{forma.PPS})
 	}
 
 	// setup a single media
@@ -79,6 +80,8 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	firstRandomAccess := false
 
 	// called when a RTP packet arrives
 	c.OnPacketRTP(medi, forma, func(pkt *rtp.Packet) {
@@ -98,20 +101,25 @@ func main() {
 			return
 		}
 
-		for _, nalu := range au {
-			// convert NALUs into RGBA frames
-			img, err := frameDec.decode(nalu)
-			if err != nil {
-				panic(err)
-			}
-
-			// wait for a frame
-			if img == nil {
-				continue
-			}
-
-			log.Printf("decoded frame with PTS %v and size %v", pts, img.Bounds().Max)
+		// wait for a random access unit
+		if !firstRandomAccess && !h265.IsRandomAccess(au) {
+			log.Printf("waiting for a random access unit")
+			return
 		}
+		firstRandomAccess = true
+
+		// convert H265 access units into RGBA frames
+		img, err := h265Dec.decode(au)
+		if err != nil {
+			panic(err)
+		}
+
+		// wait for a frame
+		if img == nil {
+			return
+		}
+
+		log.Printf("decoded frame with PTS %v and size %v", pts, img.Bounds().Max)
 	})
 
 	// start playing

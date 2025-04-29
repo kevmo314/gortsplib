@@ -18,18 +18,19 @@ func ntpTimeGoToRTCP(v time.Time) uint64 {
 
 // RTCPSender is a utility to generate RTCP sender reports.
 type RTCPSender struct {
-	clockRate       float64
-	period          time.Duration
-	timeNow         func() time.Time
-	writePacketRTCP func(rtcp.Packet)
-	mutex           sync.RWMutex
+	ClockRate       int
+	Period          time.Duration
+	TimeNow         func() time.Time
+	WritePacketRTCP func(rtcp.Packet)
+
+	mutex sync.RWMutex
 
 	// data from RTP packets
-	initialized        bool
+	firstRTPPacketSent bool
 	lastTimeRTP        uint32
 	lastTimeNTP        time.Time
 	lastTimeSystem     time.Time
-	senderSSRC         uint32
+	localSSRC          uint32
 	lastSequenceNumber uint16
 	packetCount        uint32
 	octetCount         uint32
@@ -39,40 +40,41 @@ type RTCPSender struct {
 }
 
 // New allocates a RTCPSender.
+//
+// Deprecated: replaced by Initialize().
 func New(
 	clockRate int,
 	period time.Duration,
 	timeNow func() time.Time,
 	writePacketRTCP func(rtcp.Packet),
 ) *RTCPSender {
-	if timeNow == nil {
-		timeNow = time.Now
-	}
-
 	rs := &RTCPSender{
-		clockRate:       float64(clockRate),
-		period:          period,
-		timeNow:         timeNow,
-		writePacketRTCP: writePacketRTCP,
-		terminate:       make(chan struct{}),
-		done:            make(chan struct{}),
+		ClockRate:       clockRate,
+		Period:          period,
+		TimeNow:         timeNow,
+		WritePacketRTCP: writePacketRTCP,
 	}
-
-	go rs.run()
+	rs.Initialize()
 
 	return rs
 }
 
-// Close closes the RTCPSender.
-func (rs *RTCPSender) Close() {
-	close(rs.terminate)
-	<-rs.done
+// Initialize initializes a RTCPSender.
+func (rs *RTCPSender) Initialize() {
+	if rs.TimeNow == nil {
+		rs.TimeNow = time.Now
+	}
+
+	rs.terminate = make(chan struct{})
+	rs.done = make(chan struct{})
+
+	go rs.run()
 }
 
 func (rs *RTCPSender) run() {
 	defer close(rs.done)
 
-	t := time.NewTicker(rs.period)
+	t := time.NewTicker(rs.Period)
 	defer t.Stop()
 
 	for {
@@ -80,7 +82,7 @@ func (rs *RTCPSender) run() {
 		case <-t.C:
 			report := rs.report()
 			if report != nil {
-				rs.writePacketRTCP(report)
+				rs.WritePacketRTCP(report)
 			}
 
 		case <-rs.terminate:
@@ -93,21 +95,27 @@ func (rs *RTCPSender) report() rtcp.Packet {
 	rs.mutex.Lock()
 	defer rs.mutex.Unlock()
 
-	if !rs.initialized {
+	if !rs.firstRTPPacketSent {
 		return nil
 	}
 
-	systemTimeDiff := rs.timeNow().Sub(rs.lastTimeSystem)
+	systemTimeDiff := rs.TimeNow().Sub(rs.lastTimeSystem)
 	ntpTime := rs.lastTimeNTP.Add(systemTimeDiff)
-	rtpTime := rs.lastTimeRTP + uint32(systemTimeDiff.Seconds()*rs.clockRate)
+	rtpTime := rs.lastTimeRTP + uint32(systemTimeDiff.Seconds()*float64(rs.ClockRate))
 
 	return &rtcp.SenderReport{
-		SSRC:        rs.senderSSRC,
+		SSRC:        rs.localSSRC,
 		NTPTime:     ntpTimeGoToRTCP(ntpTime),
 		RTPTime:     rtpTime,
 		PacketCount: rs.packetCount,
 		OctetCount:  rs.octetCount,
 	}
+}
+
+// Close closes the RTCPSender.
+func (rs *RTCPSender) Close() {
+	close(rs.terminate)
+	<-rs.done
 }
 
 // ProcessPacket extracts data from RTP packets.
@@ -116,11 +124,11 @@ func (rs *RTCPSender) ProcessPacket(pkt *rtp.Packet, ntp time.Time, ptsEqualsDTS
 	defer rs.mutex.Unlock()
 
 	if ptsEqualsDTS {
-		rs.initialized = true
+		rs.firstRTPPacketSent = true
 		rs.lastTimeRTP = pkt.Timestamp
 		rs.lastTimeNTP = ntp
-		rs.lastTimeSystem = rs.timeNow()
-		rs.senderSSRC = pkt.SSRC
+		rs.lastTimeSystem = rs.TimeNow()
+		rs.localSSRC = pkt.SSRC
 	}
 
 	rs.lastSequenceNumber = pkt.SequenceNumber
@@ -130,15 +138,50 @@ func (rs *RTCPSender) ProcessPacket(pkt *rtp.Packet, ntp time.Time, ptsEqualsDTS
 }
 
 // SenderSSRC returns the SSRC of outgoing RTP packets.
+//
+// Deprecated: replaced by Stats().
 func (rs *RTCPSender) SenderSSRC() (uint32, bool) {
-	rs.mutex.RLock()
-	defer rs.mutex.RUnlock()
-	return rs.senderSSRC, rs.initialized
+	stats := rs.Stats()
+	if stats == nil {
+		return 0, false
+	}
+
+	return stats.LocalSSRC, true
 }
 
 // LastPacketData returns metadata of the last RTP packet.
+//
+// Deprecated: replaced by Stats().
 func (rs *RTCPSender) LastPacketData() (uint16, uint32, time.Time, bool) {
+	stats := rs.Stats()
+	if stats == nil {
+		return 0, 0, time.Time{}, false
+	}
+
+	return stats.LastSequenceNumber, stats.LastRTP, stats.LastNTP, true
+}
+
+// Stats are statistics.
+type Stats struct {
+	LocalSSRC          uint32
+	LastSequenceNumber uint16
+	LastRTP            uint32
+	LastNTP            time.Time
+}
+
+// Stats returns statistics.
+func (rs *RTCPSender) Stats() *Stats {
 	rs.mutex.RLock()
 	defer rs.mutex.RUnlock()
-	return rs.lastSequenceNumber, rs.lastTimeRTP, rs.lastTimeNTP, rs.initialized
+
+	if !rs.firstRTPPacketSent {
+		return nil
+	}
+
+	return &Stats{
+		LocalSSRC:          rs.localSSRC,
+		LastSequenceNumber: rs.lastSequenceNumber,
+		LastRTP:            rs.lastTimeRTP,
+		LastNTP:            rs.lastTimeNTP,
+	}
 }

@@ -3,7 +3,7 @@ package rtpav1
 import (
 	"crypto/rand"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/av1"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/av1"
 	"github.com/pion/rtp"
 )
 
@@ -69,14 +69,9 @@ func (e *Encoder) Init() error {
 
 // Encode encodes OBUs into RTP packets.
 func (e *Encoder) Encode(obus [][]byte) ([]*rtp.Packet, error) {
-	isKeyFrame, err := av1.ContainsKeyFrame(obus)
-	if err != nil {
-		return nil, err
-	}
-
 	var curPacket *rtp.Packet
 	var packets []*rtp.Packet
-	curPayloadLen := 0
+	obusInPacket := 0
 
 	createNewPacket := func(z bool) {
 		curPacket = &rtp.Packet{
@@ -90,7 +85,7 @@ func (e *Encoder) Encode(obus [][]byte) ([]*rtp.Packet, error) {
 		}
 		e.sequenceNumber++
 		packets = append(packets, curPacket)
-		curPayloadLen = 1
+		obusInPacket = 0
 
 		if z {
 			curPacket.Payload[0] |= 1 << 7
@@ -105,28 +100,58 @@ func (e *Encoder) Encode(obus [][]byte) ([]*rtp.Packet, error) {
 
 	createNewPacket(false)
 
-	for _, obu := range obus {
+	maxFragmentedLEBSize := av1.LEB128(e.PayloadMaxSize).MarshalSize()
+
+	for i, obu := range obus {
 		for {
-			avail := e.PayloadMaxSize - curPayloadLen
+			avail := e.PayloadMaxSize - len(curPacket.Payload)
 			obuLen := len(obu)
-			needed := obuLen + 2
+			omitSize := (i == (len(obus)-1) && obusInPacket < 3)
+
+			var obuLenLEB av1.LEB128
+			var obuLenLEBSize int
+			var needed int
+
+			if omitSize {
+				needed = obuLen
+			} else {
+				obuLenLEB = av1.LEB128(obuLen)
+				obuLenLEBSize = obuLenLEB.MarshalSize()
+				needed = obuLen + obuLenLEBSize
+			}
 
 			if needed <= avail {
-				buf := make([]byte, av1.LEB128MarshalSize(uint(obuLen)))
-				av1.LEB128MarshalTo(uint(obuLen), buf)
-				curPacket.Payload = append(curPacket.Payload, buf...)
-				curPacket.Payload = append(curPacket.Payload, obu...)
-				curPayloadLen += len(buf) + obuLen
+				if omitSize {
+					curPacket.Payload[0] |= byte((obusInPacket + 1) << 4) // W
+					curPacket.Payload = append(curPacket.Payload, obu...)
+				} else {
+					buf := make([]byte, obuLenLEBSize)
+					obuLenLEB.MarshalTo(buf)
+					curPacket.Payload = append(curPacket.Payload, buf...)
+					curPacket.Payload = append(curPacket.Payload, obu...)
+					obusInPacket++
+				}
 				break
 			}
 
-			if avail > 2 {
-				fragmentLen := avail - 2
-				buf := make([]byte, av1.LEB128MarshalSize(uint(fragmentLen)))
-				av1.LEB128MarshalTo(uint(fragmentLen), buf)
-				curPacket.Payload = append(curPacket.Payload, buf...)
-				curPacket.Payload = append(curPacket.Payload, obu[:fragmentLen]...)
-				obu = obu[fragmentLen:]
+			if omitSize {
+				if avail > 0 {
+					curPacket.Payload[0] |= byte((obusInPacket + 1) << 4) // W
+					curPacket.Payload = append(curPacket.Payload, obu[:avail]...)
+					obu = obu[avail:]
+				}
+			} else {
+				if avail > maxFragmentedLEBSize {
+					fragmentLen := avail - maxFragmentedLEBSize
+					fragmentLenLEB := av1.LEB128(fragmentLen)
+					fragmentLenLEBSize := fragmentLenLEB.MarshalSize()
+
+					buf := make([]byte, fragmentLenLEBSize)
+					fragmentLenLEB.MarshalTo(buf)
+					curPacket.Payload = append(curPacket.Payload, buf...)
+					curPacket.Payload = append(curPacket.Payload, obu[:fragmentLen]...)
+					obu = obu[fragmentLen:]
+				}
 			}
 
 			finalizeCurPacket(true)
@@ -136,7 +161,7 @@ func (e *Encoder) Encode(obus [][]byte) ([]*rtp.Packet, error) {
 
 	finalizeCurPacket(false)
 
-	if isKeyFrame {
+	if av1.IsRandomAccess2(obus) {
 		packets[0].Payload[0] |= 1 << 3
 	}
 

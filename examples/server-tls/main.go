@@ -19,8 +19,8 @@ import (
 // 3. allow multiple clients to read that stream with TCP
 
 type serverHandler struct {
-	s         *gortsplib.Server
-	mutex     sync.Mutex
+	server    *gortsplib.Server
+	mutex     sync.RWMutex
 	stream    *gortsplib.ServerStream
 	publisher *gortsplib.ServerSession
 }
@@ -44,8 +44,8 @@ func (sh *serverHandler) OnSessionOpen(ctx *gortsplib.ServerHandlerOnSessionOpen
 func (sh *serverHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 	log.Printf("session closed")
 
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
+	sh.mutex.RLock()
+	defer sh.mutex.RUnlock()
 
 	// if the session is the publisher,
 	// close the stream and disconnect any reader.
@@ -57,10 +57,10 @@ func (sh *serverHandler) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionClo
 
 // called when receiving a DESCRIBE request.
 func (sh *serverHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("describe request")
+	log.Printf("DESCRIBE request")
 
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
+	sh.mutex.RLock()
+	defer sh.mutex.RUnlock()
 
 	// no one is publishing yet
 	if sh.stream == nil {
@@ -77,10 +77,10 @@ func (sh *serverHandler) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (
 
 // called when receiving an ANNOUNCE request.
 func (sh *serverHandler) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (*base.Response, error) {
-	log.Printf("announce request")
+	log.Printf("ANNOUNCE request")
 
-	sh.mutex.Lock()
-	defer sh.mutex.Unlock()
+	sh.mutex.RLock()
+	defer sh.mutex.RUnlock()
 
 	// disconnect existing publisher
 	if sh.stream != nil {
@@ -89,7 +89,14 @@ func (sh *serverHandler) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (
 	}
 
 	// create the stream and save the publisher
-	sh.stream = gortsplib.NewServerStream(sh.s, ctx.Description)
+	sh.stream = &gortsplib.ServerStream{
+		Server: sh.server,
+		Desc:   ctx.Description,
+	}
+	err := sh.stream.Initialize()
+	if err != nil {
+		panic(err)
+	}
 	sh.publisher = ctx.Session
 
 	return &base.Response{
@@ -99,7 +106,17 @@ func (sh *serverHandler) OnAnnounce(ctx *gortsplib.ServerHandlerOnAnnounceCtx) (
 
 // called when receiving a SETUP request.
 func (sh *serverHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("setup request")
+	log.Printf("SETUP request")
+
+	// SETUP is used by both readers and publishers. In case of publishers, just return StatusOK.
+	if ctx.Session.State() == gortsplib.ServerSessionStatePreRecord {
+		return &base.Response{
+			StatusCode: base.StatusOK,
+		}, nil, nil
+	}
+
+	sh.mutex.RLock()
+	defer sh.mutex.RUnlock()
 
 	// no one is publishing yet
 	if sh.stream == nil {
@@ -115,7 +132,7 @@ func (sh *serverHandler) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.
 
 // called when receiving a PLAY request.
 func (sh *serverHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	log.Printf("play request")
+	log.Printf("PLAY request")
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
@@ -124,7 +141,7 @@ func (sh *serverHandler) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Re
 
 // called when receiving a RECORD request.
 func (sh *serverHandler) OnRecord(ctx *gortsplib.ServerHandlerOnRecordCtx) (*base.Response, error) {
-	log.Printf("record request")
+	log.Printf("RECORD request")
 
 	// called when receiving a RTP packet
 	ctx.Session.OnPacketRTPAny(func(medi *description.Media, forma format.Format, pkt *rtp.Packet) {
@@ -148,13 +165,13 @@ func main() {
 
 	// configure the server
 	h := &serverHandler{}
-	h.s = &gortsplib.Server{
+	h.server = &gortsplib.Server{
 		Handler:     h,
 		TLSConfig:   &tls.Config{Certificates: []tls.Certificate{cert}},
 		RTSPAddress: ":8322",
 	}
 
 	// start server and wait until a fatal error
-	log.Printf("server is ready")
-	panic(h.s.StartAndWait())
+	log.Printf("server is ready on %s", h.server.RTSPAddress)
+	panic(h.server.StartAndWait())
 }

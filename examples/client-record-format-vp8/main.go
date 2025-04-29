@@ -1,77 +1,125 @@
+//go:build cgo
+
 package main
 
 import (
+	"crypto/rand"
 	"log"
-	"net"
+	"time"
 
 	"github.com/bluenviron/gortsplib/v4"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
-	"github.com/pion/rtp"
 )
 
 // This example shows how to
-// 1. generate a VP8 stream and RTP packets with GStreamer
-// 2. connect to a RTSP server, announce a VP8 format
-// 3. route the packets from GStreamer to the server
+// 1. connect to a RTSP server, announce a VP8 format
+// 2. generate dummy RGBA images
+// 3. encode images with VP8
+// 4. generate RTP packets from VP8
+// 5. write RTP packets to the server
+
+// This example requires the FFmpeg libraries, that can be installed with this command:
+// apt install -y libavcodec-dev libswscale-dev gcc pkg-config
+
+func multiplyAndDivide(v, m, d int64) int64 {
+	secs := v / d
+	dec := v % d
+	return (secs*m + dec*m/d)
+}
+
+func randUint32() (uint32, error) {
+	var b [4]byte
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, err
+	}
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3]), nil
+}
 
 func main() {
-	// open a listener to receive RTP/VP8 packets
-	pc, err := net.ListenPacket("udp", "localhost:9000")
-	if err != nil {
-		panic(err)
+	// create a stream description that contains a VP8 format
+	forma := &format.VP8{
+		PayloadTyp: 96,
 	}
-	defer pc.Close()
-
-	log.Println("Waiting for a RTP/VP8 stream on UDP port 9000 - you can send one with GStreamer:\n" +
-		"gst-launch-1.0 videotestsrc ! video/x-raw,width=1920,height=1080" +
-		" ! vp8enc cpu-used=8 deadline=1" +
-		" ! rtpvp8pay ! udpsink host=127.0.0.1 port=9000")
-
-	// wait for first packet
-	buf := make([]byte, 2048)
-	n, _, err := pc.ReadFrom(buf)
-	if err != nil {
-		panic(err)
-	}
-	log.Println("stream connected")
-
-	// create a description that contains a VP8 format
 	desc := &description.Session{
 		Medias: []*description.Media{{
-			Type: description.MediaTypeVideo,
-			Formats: []format.Format{&format.VP8{
-				PayloadTyp: 96,
-			}},
+			Type:    description.MediaTypeVideo,
+			Formats: []format.Format{forma},
 		}},
 	}
 
-	// connect to the server and start recording
+	// connect to the server, announce the format and start recording
 	c := gortsplib.Client{}
-	err = c.StartRecording("rtsp://localhost:8554/mystream", desc)
+	err := c.StartRecording("rtsp://myuser:mypass@localhost:8554/mystream", desc)
 	if err != nil {
 		panic(err)
 	}
 	defer c.Close()
 
-	var pkt rtp.Packet
-	for {
-		// parse RTP packet
-		err = pkt.Unmarshal(buf[:n])
+	// setup RGBA -> VP8 encoder
+	vp8enc := &vp8Encoder{
+		Width:  640,
+		Height: 480,
+		FPS:    5,
+	}
+	err = vp8enc.initialize()
+	if err != nil {
+		panic(err)
+	}
+	defer vp8enc.close()
+
+	// setup VP8 -> RTP encoder
+	rtpEnc, err := forma.CreateEncoder()
+	if err != nil {
+		panic(err)
+	}
+
+	start := time.Now()
+
+	randomStart, err := randUint32()
+	if err != nil {
+		panic(err)
+	}
+
+	// setup a ticker to sleep between frames
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		// get current timestamp
+		pts := multiplyAndDivide(int64(time.Since(start)), int64(forma.ClockRate()), int64(time.Second))
+
+		// create a dummy image
+		img := createDummyImage()
+
+		// encode the image with VP8
+		frame, pts, err := vp8enc.encode(img, pts)
 		if err != nil {
 			panic(err)
 		}
 
-		// route RTP packet to the server
-		err = c.WritePacketRTP(desc.Medias[0], &pkt)
+		// wait for a VP8 frame
+		if frame == nil {
+			continue
+		}
+
+		// generate RTP packets from the VP8 frame
+		pkts, err := rtpEnc.Encode(frame)
 		if err != nil {
 			panic(err)
 		}
 
-		// read another RTP packet from source
-		n, _, err = pc.ReadFrom(buf)
-		if err != nil {
-			panic(err)
+		log.Printf("writing RTP packets with PTS=%d, frame size=%d, pkt count=%d", pts, len(frame), len(pkts))
+
+		// write RTP packets to the server
+		for _, pkt := range pkts {
+			pkt.Timestamp += uint32(int64(randomStart) + pts)
+
+			err = c.WritePacketRTP(desc.Medias[0], pkt)
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 }

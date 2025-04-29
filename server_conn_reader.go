@@ -2,7 +2,7 @@ package gortsplib
 
 import (
 	"errors"
-	"sync/atomic"
+	"fmt"
 	"time"
 
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
@@ -25,26 +25,35 @@ func isSwitchReadFuncError(err error) bool {
 type serverConnReader struct {
 	sc *ServerConn
 
-	chReadDone chan struct{}
+	chRequest chan readReq
+	chError   chan error
 }
 
 func (cr *serverConnReader) initialize() {
-	cr.chReadDone = make(chan struct{})
+	cr.chRequest = make(chan readReq)
+	cr.chError = make(chan error)
 
 	go cr.run()
 }
 
 func (cr *serverConnReader) wait() {
-	<-cr.chReadDone
+	for {
+		select {
+		case <-cr.chError:
+			return
+
+		case req := <-cr.chRequest:
+			req.res <- fmt.Errorf("terminated")
+		}
+	}
 }
 
 func (cr *serverConnReader) run() {
-	defer close(cr.chReadDone)
-
 	readFunc := cr.readFuncStandard
 
 	for {
 		err := readFunc()
+
 		var eerr switchReadFuncError
 		if errors.As(err, &eerr) {
 			if eerr.tcp {
@@ -55,7 +64,7 @@ func (cr *serverConnReader) run() {
 			continue
 		}
 
-		cr.sc.readError(err)
+		cr.chError <- err
 		break
 	}
 }
@@ -74,7 +83,9 @@ func (cr *serverConnReader) readFuncStandard() error {
 		case *base.Request:
 			cres := make(chan error)
 			req := readReq{req: what, res: cres}
-			err := cr.sc.readRequest(req)
+			cr.chRequest <- req
+
+			err := <-cres
 			if err != nil {
 				return err
 			}
@@ -92,7 +103,7 @@ func (cr *serverConnReader) readFuncTCP() error {
 	// reset deadline
 	cr.sc.nconn.SetReadDeadline(time.Time{})
 
-	cr.sc.session.startWriter()
+	cr.sc.session.asyncStartWriter()
 
 	for {
 		if cr.sc.session.state == ServerSessionStateRecord {
@@ -108,7 +119,9 @@ func (cr *serverConnReader) readFuncTCP() error {
 		case *base.Request:
 			cres := make(chan error)
 			req := readReq{req: what, res: cres}
-			err := cr.sc.readRequest(req)
+			cr.chRequest <- req
+
+			err := <-cres
 			if err != nil {
 				return err
 			}
@@ -117,8 +130,6 @@ func (cr *serverConnReader) readFuncTCP() error {
 			return liberrors.ErrServerUnexpectedResponse{}
 
 		case *base.InterleavedFrame:
-			atomic.AddUint64(cr.sc.session.bytesReceived, uint64(len(what.Payload)))
-
 			if cb, ok := cr.sc.session.tcpCallbackByChannel[what.Channel]; ok {
 				cb(what.Payload)
 			}

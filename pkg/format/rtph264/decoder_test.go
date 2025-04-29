@@ -5,7 +5,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/h264"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h264"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -189,40 +189,125 @@ func TestDecodeAnnexB(t *testing.T) {
 }
 
 func TestDecodeAccessUnit(t *testing.T) {
+	for _, ca := range []struct {
+		name string
+		pkts []*rtp.Packet
+		au   [][]byte
+	}{
+		{
+			"marker-splitted",
+			[]*rtp.Packet{
+				{
+					Header: rtp.Header{
+						Version:        2,
+						Marker:         false,
+						PayloadType:    96,
+						SequenceNumber: 17647,
+						Timestamp:      2289531307,
+						SSRC:           0x9dbb7812,
+					},
+					Payload: []byte{1, 2},
+				},
+				{
+					Header: rtp.Header{
+						Version:        2,
+						Marker:         true,
+						PayloadType:    96,
+						SequenceNumber: 17647,
+						Timestamp:      2289531307,
+						SSRC:           0x9dbb7812,
+					},
+					Payload: []byte{3, 4},
+				},
+			},
+			[][]byte{{1, 2}, {3, 4}},
+		},
+		{
+			"timestamp-splitted (FLIR M400)",
+			[]*rtp.Packet{
+				{
+					Header: rtp.Header{
+						Version:        2,
+						Marker:         false,
+						PayloadType:    96,
+						SequenceNumber: 17647,
+						Timestamp:      2289531307,
+						SSRC:           0x9dbb7812,
+					},
+					Payload: []byte{1, 2},
+				},
+				{
+					Header: rtp.Header{
+						Version:        2,
+						Marker:         false,
+						PayloadType:    96,
+						SequenceNumber: 17647,
+						Timestamp:      2289531308,
+						SSRC:           0x9dbb7812,
+					},
+					Payload: []byte{3, 4},
+				},
+			},
+			[][]byte{{1, 2}},
+		},
+	} {
+		t.Run(ca.name, func(t *testing.T) {
+			d := &Decoder{}
+			err := d.Init()
+			require.NoError(t, err)
+
+			var au [][]byte
+
+			for i, pkt := range ca.pkts {
+				au, err = d.Decode(pkt)
+				if i != len(ca.pkts)-1 {
+					require.Equal(t, ErrMorePacketsNeeded, err)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, ca.au, au)
+				}
+			}
+		})
+	}
+}
+
+func TestDecoderErrorNALUSize(t *testing.T) {
 	d := &Decoder{}
 	err := d.Init()
 	require.NoError(t, err)
 
-	nalus, err := d.Decode(&rtp.Packet{
-		Header: rtp.Header{
-			Version:        2,
-			Marker:         false,
-			PayloadType:    96,
-			SequenceNumber: 17647,
-			Timestamp:      2289531307,
-			SSRC:           0x9dbb7812,
-		},
-		Payload: []byte{0x01, 0x02},
-	})
-	require.Equal(t, ErrMorePacketsNeeded, err)
-	require.Equal(t, [][]byte(nil), nalus)
+	size := 0
+	i := uint16(0)
 
-	nalus, err = d.Decode(&rtp.Packet{
-		Header: rtp.Header{
-			Version:        2,
-			Marker:         true,
-			PayloadType:    96,
-			SequenceNumber: 17647,
-			Timestamp:      2289531307,
-			SSRC:           0x9dbb7812,
-		},
-		Payload: []byte{0x01, 0x02},
-	})
-	require.NoError(t, err)
-	require.Equal(t, [][]byte{{0x01, 0x02}, {0x01, 0x02}}, nalus)
+	for size < h264.MaxAccessUnitSize {
+		flags := byte(0)
+		if size == 0 {
+			flags = 0b10000000
+		}
+
+		_, err = d.Decode(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         false,
+				PayloadType:    96,
+				SequenceNumber: 17645 + i,
+				Timestamp:      2289527317,
+				SSRC:           0x9dbb7812,
+			},
+			Payload: append(
+				[]byte{byte(h264.NALUTypeFUA), flags},
+				bytes.Repeat([]byte{1, 2, 3, 4}, 1400/4)...,
+			),
+		})
+
+		size += 1400
+		i++
+	}
+
+	require.EqualError(t, err, "NALU size (8388801) is too big, maximum is 8388608")
 }
 
-func TestDecoderErrorLimit(t *testing.T) {
+func TestDecoderErrorNALUCount(t *testing.T) {
 	d := &Decoder{}
 	err := d.Init()
 	require.NoError(t, err)
@@ -241,7 +326,7 @@ func TestDecoderErrorLimit(t *testing.T) {
 		})
 	}
 
-	require.EqualError(t, err, "NALU count exceeds maximum allowed (25)")
+	require.EqualError(t, err, "NALU count (26) exceeds maximum allowed (25)")
 }
 
 func TestDecodeErrorMissingPacket(t *testing.T) {
@@ -275,32 +360,39 @@ func TestDecodeErrorMissingPacket(t *testing.T) {
 }
 
 func FuzzDecoder(f *testing.F) {
-	f.Fuzz(func(_ *testing.T, a []byte, b []byte) {
+	f.Fuzz(func(t *testing.T, a []byte, am bool, b []byte, bm bool) {
 		d := &Decoder{}
-		d.Init() //nolint:errcheck
+		err := d.Init()
+		require.NoError(t, err)
 
-		d.Decode(&rtp.Packet{ //nolint:errcheck
+		au, err := d.Decode(&rtp.Packet{
 			Header: rtp.Header{
-				Version:        2,
-				Marker:         false,
-				PayloadType:    96,
+				Marker:         am,
 				SequenceNumber: 17645,
-				Timestamp:      2289527317,
-				SSRC:           0x9dbb7812,
 			},
 			Payload: a,
 		})
 
-		d.Decode(&rtp.Packet{ //nolint:errcheck
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         false,
-				PayloadType:    96,
-				SequenceNumber: 17645,
-				Timestamp:      2289527317,
-				SSRC:           0x9dbb7812,
-			},
-			Payload: b,
-		})
+		if errors.Is(err, ErrMorePacketsNeeded) {
+			au, err = d.Decode(&rtp.Packet{
+				Header: rtp.Header{
+					Marker:         bm,
+					SequenceNumber: 17646,
+				},
+				Payload: b,
+			})
+		}
+
+		if err == nil {
+			if len(au) == 0 {
+				t.Errorf("should not happen")
+			}
+
+			for _, nalu := range au {
+				if len(nalu) == 0 {
+					t.Errorf("should not happen")
+				}
+			}
+		}
 	})
 }

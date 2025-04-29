@@ -21,7 +21,7 @@ import (
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
 	"github.com/bluenviron/gortsplib/v4/pkg/format"
 	"github.com/bluenviron/gortsplib/v4/pkg/headers"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 )
 
 func ipPtr(v net.IP) *net.IP {
@@ -544,6 +544,12 @@ func TestClientPlay(t *testing.T) {
 			require.NoError(t, err)
 
 			<-packetRecv
+
+			s := c.Stats()
+			require.Greater(t, s.Session.BytesSent, uint64(19))
+			require.Less(t, s.Session.BytesSent, uint64(41))
+			require.Greater(t, s.Session.BytesReceived, uint64(31))
+			require.Less(t, s.Session.BytesReceived, uint64(37))
 		})
 	}
 }
@@ -1322,7 +1328,7 @@ func TestClientPlayAutomaticProtocol(t *testing.T) {
 				require.NoError(t, err2)
 				require.Equal(t, base.Describe, req.Method)
 
-				err2 = auth.Validate(req, "myuser", "mypass", nil, "IPCAM", nonce)
+				err2 = auth.Verify(req, "myuser", "mypass", nil, "IPCAM", nonce)
 				require.NoError(t, err2)
 
 				err2 = conn.WriteResponse(&base.Response{
@@ -1434,7 +1440,7 @@ func TestClientPlayAutomaticProtocol(t *testing.T) {
 				require.Equal(t, base.Setup, req.Method)
 				require.Equal(t, mustParseURL("rtsp://localhost:8554/teststream/"+medias[0].Control), req.URL)
 
-				err2 = auth.Validate(req, "myuser", "mypass", nil, "IPCAM", nonce)
+				err2 = auth.Verify(req, "myuser", "mypass", nil, "IPCAM", nonce)
 				require.NoError(t, err2)
 
 				var inTH headers.Transport
@@ -1807,7 +1813,7 @@ func TestClientPlayRedirect(t *testing.T) {
 	}
 }
 
-func TestClientPlayPause(t *testing.T) {
+func TestClientPlayPausePlay(t *testing.T) {
 	writeFrames := func(inTH *headers.Transport, conn *conn.Conn) (chan struct{}, chan struct{}) {
 		writerTerminate := make(chan struct{})
 		writerDone := make(chan struct{})
@@ -1955,8 +1961,8 @@ func TestClientPlayPause(t *testing.T) {
 				})
 				require.NoError(t, err2)
 
-				req, err = conn.ReadRequest()
-				require.NoError(t, err)
+				req, err2 = conn.ReadRequest()
+				require.NoError(t, err2)
 				require.Equal(t, base.Play, req.Method)
 
 				err2 = conn.WriteResponse(&base.Response{
@@ -3138,8 +3144,8 @@ func TestClientPlayDecodeErrors(t *testing.T) {
 					v := TransportTCP
 					return &v
 				}(),
-				OnPacketLost: func(err error) {
-					require.EqualError(t, err, "69 RTP packets lost")
+				OnPacketsLost: func(lost uint64) {
+					require.Equal(t, uint64(69), lost)
 					close(errorRecv)
 				},
 				OnDecodeError: func(err error) {

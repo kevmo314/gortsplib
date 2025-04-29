@@ -3,8 +3,8 @@ package rtpmpeg4audio
 import (
 	"fmt"
 
-	"github.com/bluenviron/mediacommon/pkg/bits"
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/bits"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/pion/rtp"
 )
 
@@ -85,9 +85,10 @@ func (d *Decoder) decodeGeneric(pkt *rtp.Packet) ([][]byte, error) {
 		d.fragmentsSize += int(dataLens[0])
 
 		if d.fragmentsSize > mpeg4audio.MaxAccessUnitSize {
+			errSize := d.fragmentsSize
 			d.resetFragments()
 			return nil, fmt.Errorf("access unit size (%d) is too big, maximum is %d",
-				d.fragmentsSize, mpeg4audio.MaxAccessUnitSize)
+				errSize, mpeg4audio.MaxAccessUnitSize)
 		}
 
 		d.fragments = append(d.fragments, payload[:dataLens[0]])

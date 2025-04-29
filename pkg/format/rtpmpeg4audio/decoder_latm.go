@@ -3,7 +3,7 @@ package rtpmpeg4audio
 import (
 	"fmt"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/mpeg4audio"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/mpeg4audio"
 	"github.com/pion/rtp"
 )
 
@@ -25,9 +25,10 @@ func (d *Decoder) decodeLATM(pkt *rtp.Packet) ([][]byte, error) {
 			// there could be other data, due to otherDataPresent. Ignore it.
 		} else {
 			if pl > mpeg4audio.MaxAccessUnitSize {
+				errSize := pl
 				d.resetFragments()
 				return nil, fmt.Errorf("access unit size (%d) is too big, maximum is %d",
-					pl, mpeg4audio.MaxAccessUnitSize)
+					errSize, mpeg4audio.MaxAccessUnitSize)
 			}
 
 			d.fragments = append(d.fragments, buf)

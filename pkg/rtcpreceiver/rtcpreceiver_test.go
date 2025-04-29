@@ -16,14 +16,14 @@ func uint32Ptr(v uint32) *uint32 {
 func TestRTCPReceiverBase(t *testing.T) {
 	done := make(chan struct{})
 
-	rr, err := New(
-		90000,
-		uint32Ptr(0x65f83afb),
-		500*time.Millisecond,
-		func() time.Time {
+	rr := &RTCPReceiver{
+		ClockRate: 90000,
+		LocalSSRC: uint32Ptr(0x65f83afb),
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
 			return time.Date(2008, 0o5, 20, 22, 15, 22, 0, time.UTC)
 		},
-		func(pkt rtcp.Packet) {
+		WritePacketRTCP: func(pkt rtcp.Packet) {
 			require.Equal(t, &rtcp.ReceiverReport{
 				SSRC: 0x65f83afb,
 				Reports: []rtcp.ReceptionReport{
@@ -36,7 +36,9 @@ func TestRTCPReceiverBase(t *testing.T) {
 				},
 			}, pkt)
 			close(done)
-		})
+		},
+	}
+	err := rr.Initialize()
 	require.NoError(t, err)
 	defer rr.Close()
 
@@ -86,14 +88,14 @@ func TestRTCPReceiverBase(t *testing.T) {
 func TestRTCPReceiverOverflow(t *testing.T) {
 	done := make(chan struct{})
 
-	rr, err := New(
-		90000,
-		uint32Ptr(0x65f83afb),
-		250*time.Millisecond,
-		func() time.Time {
+	rr := &RTCPReceiver{
+		ClockRate: 90000,
+		LocalSSRC: uint32Ptr(0x65f83afb),
+		Period:    250 * time.Millisecond,
+		TimeNow: func() time.Time {
 			return time.Date(2008, 0o5, 20, 22, 15, 21, 0, time.UTC)
 		},
-		func(pkt rtcp.Packet) {
+		WritePacketRTCP: func(pkt rtcp.Packet) {
 			require.Equal(t, &rtcp.ReceiverReport{
 				SSRC: 0x65f83afb,
 				Reports: []rtcp.ReceptionReport{
@@ -106,7 +108,9 @@ func TestRTCPReceiverOverflow(t *testing.T) {
 				},
 			}, pkt)
 			close(done)
-		})
+		},
+	}
+	err := rr.Initialize()
 	require.NoError(t, err)
 	defer rr.Close()
 
@@ -155,17 +159,17 @@ func TestRTCPReceiverOverflow(t *testing.T) {
 	<-done
 }
 
-func TestRTCPReceiverPacketLost(t *testing.T) {
+func TestRTCPReceiverPacketsLost(t *testing.T) {
 	done := make(chan struct{})
 
-	rr, err := New(
-		90000,
-		uint32Ptr(0x65f83afb),
-		500*time.Millisecond,
-		func() time.Time {
+	rr := &RTCPReceiver{
+		ClockRate: 90000,
+		LocalSSRC: uint32Ptr(0x65f83afb),
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
 			return time.Date(2008, 0o5, 20, 22, 15, 21, 0, time.UTC)
 		},
-		func(pkt rtcp.Packet) {
+		WritePacketRTCP: func(pkt rtcp.Packet) {
 			require.Equal(t, &rtcp.ReceiverReport{
 				SSRC: 0x65f83afb,
 				Reports: []rtcp.ReceptionReport{
@@ -183,7 +187,9 @@ func TestRTCPReceiverPacketLost(t *testing.T) {
 				},
 			}, pkt)
 			close(done)
-		})
+		},
+	}
+	err := rr.Initialize()
 	require.NoError(t, err)
 	defer rr.Close()
 
@@ -230,17 +236,17 @@ func TestRTCPReceiverPacketLost(t *testing.T) {
 	<-done
 }
 
-func TestRTCPReceiverOverflowPacketLost(t *testing.T) {
+func TestRTCPReceiverOverflowPacketsLost(t *testing.T) {
 	done := make(chan struct{})
 
-	rr, err := New(
-		90000,
-		uint32Ptr(0x65f83afb),
-		500*time.Millisecond,
-		func() time.Time {
+	rr := &RTCPReceiver{
+		ClockRate: 90000,
+		LocalSSRC: uint32Ptr(0x65f83afb),
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
 			return time.Date(2008, 0o5, 20, 22, 15, 21, 0, time.UTC)
 		},
-		func(pkt rtcp.Packet) {
+		WritePacketRTCP: func(pkt rtcp.Packet) {
 			require.Equal(t, &rtcp.ReceiverReport{
 				SSRC: 0x65f83afb,
 				Reports: []rtcp.ReceptionReport{
@@ -258,7 +264,9 @@ func TestRTCPReceiverOverflowPacketLost(t *testing.T) {
 				},
 			}, pkt)
 			close(done)
-		})
+		},
+	}
+	err := rr.Initialize()
 	require.NoError(t, err)
 	defer rr.Close()
 
@@ -308,14 +316,14 @@ func TestRTCPReceiverOverflowPacketLost(t *testing.T) {
 func TestRTCPReceiverJitter(t *testing.T) {
 	done := make(chan struct{})
 
-	rr, err := New(
-		90000,
-		uint32Ptr(0x65f83afb),
-		500*time.Millisecond,
-		func() time.Time {
+	rr := &RTCPReceiver{
+		ClockRate: 90000,
+		LocalSSRC: uint32Ptr(0x65f83afb),
+		Period:    500 * time.Millisecond,
+		TimeNow: func() time.Time {
 			return time.Date(2008, 0o5, 20, 22, 15, 22, 0, time.UTC)
 		},
-		func(pkt rtcp.Packet) {
+		WritePacketRTCP: func(pkt rtcp.Packet) {
 			require.Equal(t, &rtcp.ReceiverReport{
 				SSRC: 0x65f83afb,
 				Reports: []rtcp.ReceptionReport{
@@ -329,7 +337,9 @@ func TestRTCPReceiverJitter(t *testing.T) {
 				},
 			}, pkt)
 			close(done)
-		})
+		},
+	}
+	err := rr.Initialize()
 	require.NoError(t, err)
 	defer rr.Close()
 

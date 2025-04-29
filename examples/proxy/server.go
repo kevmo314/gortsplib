@@ -10,14 +10,14 @@ import (
 )
 
 type server struct {
-	s      *gortsplib.Server
-	mutex  sync.Mutex
+	server *gortsplib.Server
+	mutex  sync.RWMutex
 	stream *gortsplib.ServerStream
 }
 
 func (s *server) initialize() {
 	// configure the server
-	s.s = &gortsplib.Server{
+	s.server = &gortsplib.Server{
 		Handler:           s,
 		RTSPAddress:       ":8554",
 		UDPRTPAddress:     ":8000",
@@ -50,10 +50,10 @@ func (s *server) OnSessionClose(ctx *gortsplib.ServerHandlerOnSessionCloseCtx) {
 
 // called when receiving a DESCRIBE request.
 func (s *server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("describe request")
+	log.Printf("DESCRIBE request")
 
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
 	// stream is not available yet
 	if s.stream == nil {
@@ -69,10 +69,10 @@ func (s *server) OnDescribe(ctx *gortsplib.ServerHandlerOnDescribeCtx) (*base.Re
 
 // called when receiving a SETUP request.
 func (s *server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response, *gortsplib.ServerStream, error) {
-	log.Printf("setup request")
+	log.Printf("SETUP request")
 
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.mutex.RLock()
+	defer s.mutex.RUnlock()
 
 	// stream is not available yet
 	if s.stream == nil {
@@ -88,7 +88,7 @@ func (s *server) OnSetup(ctx *gortsplib.ServerHandlerOnSetupCtx) (*base.Response
 
 // called when receiving a PLAY request.
 func (s *server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, error) {
-	log.Printf("play request")
+	log.Printf("PLAY request")
 
 	return &base.Response{
 		StatusCode: base.StatusOK,
@@ -98,7 +98,14 @@ func (s *server) OnPlay(ctx *gortsplib.ServerHandlerOnPlayCtx) (*base.Response, 
 func (s *server) setStreamReady(desc *description.Session) *gortsplib.ServerStream {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	s.stream = gortsplib.NewServerStream(s.s, desc)
+	s.stream = &gortsplib.ServerStream{
+		Server: s.server,
+		Desc:   desc,
+	}
+	err := s.stream.Initialize()
+	if err != nil {
+		panic(err)
+	}
 	return s.stream
 }
 

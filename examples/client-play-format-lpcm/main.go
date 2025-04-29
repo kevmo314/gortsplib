@@ -11,14 +11,14 @@ import (
 
 // This example shows how to
 // 1. connect to a RTSP server
-// 2. check if there's an LPCM format
+// 2. check if there's a LPCM stream
 // 3. get LPCM samples of that format
 
 func main() {
 	c := gortsplib.Client{}
 
 	// parse URL
-	u, err := base.ParseURL("rtsp://localhost:8554/mystream")
+	u, err := base.ParseURL("rtsp://myuser:mypass@localhost:8554/mystream")
 	if err != nil {
 		panic(err)
 	}

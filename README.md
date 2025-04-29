@@ -1,21 +1,21 @@
 # gortsplib
 
-[![Test](https://github.com/bluenviron/gortsplib/workflows/test/badge.svg)](https://github.com/bluenviron/gortsplib/actions?query=workflow:test)
-[![Lint](https://github.com/bluenviron/gortsplib/workflows/lint/badge.svg)](https://github.com/bluenviron/gortsplib/actions?query=workflow:lint)
+[![Test](https://github.com/bluenviron/gortsplib/actions/workflows/test.yml/badge.svg)](https://github.com/bluenviron/gortsplib/actions/workflows/test.yml)
+[![Lint](https://github.com/bluenviron/gortsplib/actions/workflows/lint.yml/badge.svg)](https://github.com/bluenviron/gortsplib/actions/workflows/lint.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/bluenviron/gortsplib)](https://goreportcard.com/report/github.com/bluenviron/gortsplib)
 [![CodeCov](https://codecov.io/gh/bluenviron/gortsplib/branch/main/graph/badge.svg)](https://app.codecov.io/gh/bluenviron/gortsplib/tree/main)
 [![PkgGoDev](https://pkg.go.dev/badge/github.com/bluenviron/gortsplib/v4)](https://pkg.go.dev/github.com/bluenviron/gortsplib/v4#pkg-index)
 
 RTSP 1.0 client and server library for the Go programming language, written for [MediaMTX](https://github.com/bluenviron/mediamtx).
 
-Go &ge; 1.21 is required.
+Go &ge; 1.23 is required.
 
 Features:
 
 * Client
   * Query servers about available media streams
-  * Play (read)
-    * Read media streams from servers with the UDP, UDP-multicast or TCP transport protocol
+  * Read media streams from a server ("play")
+    * Read streams with the UDP, UDP-multicast or TCP transport protocol
     * Read TLS-encrypted streams (TCP only)
     * Switch transport protocol automatically
     * Read selected media streams
@@ -23,20 +23,21 @@ Features:
     * Write to ONVIF back channels
     * Get PTS (relative) timestamp of incoming packets
     * Get NTP (absolute) timestamp of incoming packets
-  * Record (write)
-    * Write media streams to servers with the UDP or TCP transport protocol
+  * Write media streams to a server ("record")
+    * Write streams with the UDP or TCP transport protocol
     * Write TLS-encrypted streams (TCP only)
     * Switch transport protocol automatically
     * Pause without disconnecting from the server
 * Server
   * Handle requests from clients
-  * Record (read)
-    * Read media streams from clients with the UDP or TCP transport protocol
+  * Validate client credentials
+  * Read media streams from clients ("record")
+    * Read streams with the UDP or TCP transport protocol
     * Read TLS-encrypted streams (TCP only)
     * Get PTS (relative) timestamp of incoming packets
     * Get NTP (absolute) timestamp of incoming packets
-  * Play (write)
-    * Write media streams to clients with the UDP, UDP-multicast or TCP transport protocol
+  * Serve media streams to clients ("play")
+    * Write streams with the UDP, UDP-multicast or TCP transport protocol
     * Write TLS-encrypted streams (TCP only)
     * Compute and provide SSRC, RTP-Info to clients
 * Utilities
@@ -61,40 +62,41 @@ Features:
 * [client-play-to-record](examples/client-play-to-record/main.go)
 * [client-play-backchannel](examples/client-play-backchannel/main.go)
 * [client-play-format-av1](examples/client-play-format-av1/main.go)
+* [client-play-format-av1-to-jpeg](examples/client-play-format-av1-to-jpeg/main.go)
 * [client-play-format-g711](examples/client-play-format-g711/main.go)
-* [client-play-format-g722](examples/client-play-format-g722/main.go)
 * [client-play-format-h264](examples/client-play-format-h264/main.go)
-* [client-play-format-h264-convert-to-jpeg](examples/client-play-format-h264-convert-to-jpeg/main.go)
-* [client-play-format-h264-save-to-disk](examples/client-play-format-h264-save-to-disk/main.go)
-* [client-play-format-h264-mpeg4audio-save-to-disk](examples/client-play-format-h264-mpeg4audio-save-to-disk/main.go)
+* [client-play-format-h264-to-jpeg](examples/client-play-format-h264-to-jpeg/main.go)
+* [client-play-format-h264-to-disk](examples/client-play-format-h264-to-disk/main.go)
+* [client-play-format-h264-mpeg4audio-to-disk](examples/client-play-format-h264-mpeg4audio-to-disk/main.go)
 * [client-play-format-h265](examples/client-play-format-h265/main.go)
-* [client-play-format-h265-convert-to-jpeg](examples/client-play-format-h265-convert-to-jpeg/main.go)
-* [client-play-format-h265-save-to-disk](examples/client-play-format-h265-save-to-disk/main.go)
+* [client-play-format-h265-to-jpeg](examples/client-play-format-h265-to-jpeg/main.go)
+* [client-play-format-h265-to-disk](examples/client-play-format-h265-to-disk/main.go)
 * [client-play-format-lpcm](examples/client-play-format-lpcm/main.go)
 * [client-play-format-mjpeg](examples/client-play-format-mjpeg/main.go)
 * [client-play-format-mpeg4audio](examples/client-play-format-mpeg4audio/main.go)
-* [client-play-format-mpeg4audio-save-to-disk](examples/client-play-format-mpeg4audio-save-to-disk/main.go)
+* [client-play-format-mpeg4audio-to-disk](examples/client-play-format-mpeg4audio-to-disk/main.go)
 * [client-play-format-opus](examples/client-play-format-opus/main.go)
-* [client-play-format-opus-save-to-disk](examples/client-play-format-opus-save-to-disk/main.go)
+* [client-play-format-opus-to-disk](examples/client-play-format-opus-to-disk/main.go)
 * [client-play-format-vp8](examples/client-play-format-vp8/main.go)
 * [client-play-format-vp9](examples/client-play-format-vp9/main.go)
 * [client-record-options](examples/client-record-options/main.go)
 * [client-record-pause](examples/client-record-pause/main.go)
+* [client-record-format-av1](examples/client-record-format-av1/main.go)
 * [client-record-format-g711](examples/client-record-format-g711/main.go)
-* [client-record-format-g722](examples/client-record-format-g722/main.go)
 * [client-record-format-h264](examples/client-record-format-h264/main.go)
 * [client-record-format-h264-from-disk](examples/client-record-format-h264-from-disk/main.go)
 * [client-record-format-h265](examples/client-record-format-h265/main.go)
 * [client-record-format-lpcm](examples/client-record-format-lpcm/main.go)
 * [client-record-format-mjpeg](examples/client-record-format-mjpeg/main.go)
-* [client-record-format-mjpeg-from-image](examples/client-record-format-mjpeg-from-image/main.go)
 * [client-record-format-mpeg4audio](examples/client-record-format-mpeg4audio/main.go)
 * [client-record-format-opus](examples/client-record-format-opus/main.go)
 * [client-record-format-vp8](examples/client-record-format-vp8/main.go)
 * [client-record-format-vp9](examples/client-record-format-vp9/main.go)
 * [server](examples/server/main.go)
 * [server-tls](examples/server-tls/main.go)
-* [server-h264-save-to-disk](examples/server-h264-save-to-disk/main.go)
+* [server-auth](examples/server-auth/main.go)
+* [server-h264-to-disk](examples/server-h264-to-disk/main.go)
+* [server-h264-from-disk](examples/server-h264-from-disk/main.go)
 * [proxy](examples/proxy/main.go)
 
 ## API Documentation

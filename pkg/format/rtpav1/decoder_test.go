@@ -1,10 +1,11 @@
 package rtpav1
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/av1"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/av1"
 	"github.com/pion/rtp"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +34,49 @@ func TestDecode(t *testing.T) {
 	}
 }
 
-func TestDecoderErrorLimit(t *testing.T) {
+func TestDecoderErrorTUSize(t *testing.T) {
+	d := &Decoder{}
+	err := d.Init()
+	require.NoError(t, err)
+
+	size := 0
+	i := uint16(0)
+
+	for size < av1.MaxTemporalUnitSize {
+		var header byte
+		if i == 0 {
+			header = 0b01000000
+		} else {
+			header = 0b11000000
+		}
+
+		fragmentLenLEB := av1.LEB128(1400)
+		buf := make([]byte, fragmentLenLEB.MarshalSize())
+		fragmentLenLEB.MarshalTo(buf)
+
+		payload := append([]byte{header}, buf...)
+		payload = append(payload, bytes.Repeat([]byte{1, 2, 3, 4}, 1400/4)...)
+
+		_, err = d.Decode(&rtp.Packet{
+			Header: rtp.Header{
+				Version:        2,
+				Marker:         false,
+				PayloadType:    96,
+				SequenceNumber: 17645 + i,
+				Timestamp:      2289527317,
+				SSRC:           0x9dbb7812,
+			},
+			Payload: payload,
+		})
+
+		size += 1400
+		i++
+	}
+
+	require.EqualError(t, err, "temporal unit size (3145800) is too big, maximum is 3145728")
+}
+
+func TestDecoderErrorOBUCount(t *testing.T) {
 	d := &Decoder{}
 	err := d.Init()
 	require.NoError(t, err)
@@ -52,7 +95,7 @@ func TestDecoderErrorLimit(t *testing.T) {
 		})
 	}
 
-	require.EqualError(t, err, "OBU count exceeds maximum allowed (10)")
+	require.EqualError(t, err, "OBU count (11) exceeds maximum allowed (10)")
 }
 
 func TestDecodeErrorMissingPacket(t *testing.T) {
@@ -295,32 +338,39 @@ func TestDecodeErrorMissingPacket(t *testing.T) {
 }
 
 func FuzzDecoder(f *testing.F) {
-	f.Fuzz(func(_ *testing.T, a []byte, am bool, b []byte, bm bool) {
+	f.Fuzz(func(t *testing.T, a []byte, am bool, b []byte, bm bool) {
 		d := &Decoder{}
-		d.Init() //nolint:errcheck
+		err := d.Init()
+		require.NoError(t, err)
 
-		d.Decode(&rtp.Packet{ //nolint:errcheck
+		tu, err := d.Decode(&rtp.Packet{
 			Header: rtp.Header{
-				Version:        2,
 				Marker:         am,
-				PayloadType:    96,
 				SequenceNumber: 17645,
-				Timestamp:      2289527317,
-				SSRC:           0x9dbb7812,
 			},
 			Payload: a,
 		})
 
-		d.Decode(&rtp.Packet{ //nolint:errcheck
-			Header: rtp.Header{
-				Version:        2,
-				Marker:         bm,
-				PayloadType:    96,
-				SequenceNumber: 17646,
-				Timestamp:      2289527317,
-				SSRC:           0x9dbb7812,
-			},
-			Payload: b,
-		})
+		if errors.Is(err, ErrMorePacketsNeeded) {
+			tu, err = d.Decode(&rtp.Packet{
+				Header: rtp.Header{
+					Marker:         bm,
+					SequenceNumber: 17646,
+				},
+				Payload: b,
+			})
+		}
+
+		if err == nil {
+			if len(tu) == 0 {
+				t.Errorf("should not happen")
+			}
+
+			for _, nalu := range tu {
+				if len(nalu) == 0 {
+					t.Errorf("should not happen")
+				}
+			}
+		}
 	})
 }

@@ -10,10 +10,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bluenviron/gortsplib/v4/pkg/auth"
 	"github.com/bluenviron/gortsplib/v4/pkg/base"
 	"github.com/bluenviron/gortsplib/v4/pkg/bytecounter"
 	"github.com/bluenviron/gortsplib/v4/pkg/conn"
 	"github.com/bluenviron/gortsplib/v4/pkg/description"
+	"github.com/bluenviron/gortsplib/v4/pkg/headers"
 	"github.com/bluenviron/gortsplib/v4/pkg/liberrors"
 )
 
@@ -46,6 +48,12 @@ func serverSideDescription(d *description.Session) *description.Session {
 	return out
 }
 
+func credentialsProvided(req *base.Request) bool {
+	var auth headers.Authorization
+	err := auth.Unmarshal(req.Header["Authorization"])
+	return err == nil && auth.Username != ""
+}
+
 type readReq struct {
 	req *base.Request
 	res chan error
@@ -63,10 +71,10 @@ type ServerConn struct {
 	bc         *bytecounter.ByteCounter
 	conn       *conn.Conn
 	session    *ServerSession
+	reader     *serverConnReader
+	authNonce  string
 
 	// in
-	chReadRequest   chan readReq
-	chReadError     chan error
 	chRemoveSession chan *ServerSession
 
 	// out
@@ -84,8 +92,6 @@ func (sc *ServerConn) initialize() {
 	sc.ctx = ctx
 	sc.ctxCancel = ctxCancel
 	sc.remoteAddr = sc.nconn.RemoteAddr().(*net.TCPAddr)
-	sc.chReadRequest = make(chan readReq)
-	sc.chReadError = make(chan error)
 	sc.chRemoveSession = make(chan *ServerSession)
 	sc.done = make(chan struct{})
 
@@ -104,11 +110,15 @@ func (sc *ServerConn) NetConn() net.Conn {
 }
 
 // BytesReceived returns the number of read bytes.
+//
+// Deprecated: replaced by Stats()
 func (sc *ServerConn) BytesReceived() uint64 {
 	return sc.bc.BytesReceived()
 }
 
 // BytesSent returns the number of written bytes.
+//
+// Deprecated: replaced by Stats()
 func (sc *ServerConn) BytesSent() uint64 {
 	return sc.bc.BytesSent()
 }
@@ -121,6 +131,61 @@ func (sc *ServerConn) SetUserData(v interface{}) {
 // UserData returns some user data associated with the connection.
 func (sc *ServerConn) UserData() interface{} {
 	return sc.userData
+}
+
+// Session returns associated session.
+func (sc *ServerConn) Session() *ServerSession {
+	return sc.session
+}
+
+// Stats returns connection statistics.
+func (sc *ServerConn) Stats() *StatsConn {
+	return &StatsConn{
+		BytesReceived: sc.bc.BytesReceived(),
+		BytesSent:     sc.bc.BytesSent(),
+	}
+}
+
+// VerifyCredentials verifies credentials provided by the user.
+func (sc *ServerConn) VerifyCredentials(
+	req *base.Request,
+	expectedUser string,
+	expectedPass string,
+) bool {
+	// we do not support using an empty string as user
+	// since it interferes with credentialsProvided()
+	if expectedUser == "" {
+		return false
+	}
+
+	if sc.authNonce == "" {
+		n, err := auth.GenerateNonce()
+		if err != nil {
+			return false
+		}
+		sc.authNonce = n
+	}
+
+	err := auth.Verify(
+		req,
+		expectedUser,
+		expectedPass,
+		sc.s.AuthMethods,
+		serverAuthRealm,
+		sc.authNonce)
+
+	return (err == nil)
+}
+
+func (sc *ServerConn) handleAuthError(req *base.Request, res *base.Response) error {
+	// if credentials have not been provided, clear error and send the WWW-Authenticate header.
+	if !credentialsProvided(req) {
+		res.Header["WWW-Authenticate"] = auth.GenerateWWWAuthenticate(sc.s.AuthMethods, serverAuthRealm, sc.authNonce)
+		return nil
+	}
+
+	// if credentials have been provided (and are wrong), close the connection.
+	return liberrors.ErrServerAuth{}
 }
 
 func (sc *ServerConn) ip() net.IP {
@@ -142,10 +207,10 @@ func (sc *ServerConn) run() {
 	}
 
 	sc.conn = conn.NewConn(sc.bc)
-	cr := &serverConnReader{
+	sc.reader = &serverConnReader{
 		sc: sc,
 	}
-	cr.initialize()
+	sc.reader.initialize()
 
 	err := sc.runInner()
 
@@ -153,7 +218,9 @@ func (sc *ServerConn) run() {
 
 	sc.nconn.Close()
 
-	cr.wait()
+	if sc.reader != nil {
+		sc.reader.wait()
+	}
 
 	if sc.session != nil {
 		sc.session.removeConn(sc)
@@ -172,10 +239,11 @@ func (sc *ServerConn) run() {
 func (sc *ServerConn) runInner() error {
 	for {
 		select {
-		case req := <-sc.chReadRequest:
+		case req := <-sc.reader.chRequest:
 			req.res <- sc.handleRequestOuter(req.req)
 
-		case err := <-sc.chReadError:
+		case err := <-sc.reader.chError:
+			sc.reader = nil
 			return err
 
 		case ss := <-sc.chRemoveSession:
@@ -260,12 +328,20 @@ func (sc *ServerConn) handleRequestInner(req *base.Request) (*base.Response, err
 			})
 
 			if res.StatusCode == base.StatusOK {
+				if stream == nil && len(res.Body) == 0 {
+					panic("stream should be not nil or response body should be nonempty when StatusCode is StatusOK")
+				}
+
 				if res.Header == nil {
 					res.Header = make(base.Header)
 				}
 
 				res.Header["Content-Base"] = base.HeaderValue{req.URL.String() + "/"}
 				res.Header["Content-Type"] = base.HeaderValue{"application/sdp"}
+
+				if stream == nil {
+					return res, err
+				}
 
 				// VLC uses multicast if the SDP contains a multicast address.
 				// therefore, we introduce a special query (vlcmulticast) that allows
@@ -279,10 +355,8 @@ func (sc *ServerConn) handleRequestInner(req *base.Request) (*base.Response, err
 					}
 				}
 
-				if stream != nil {
-					byts, _ := serverSideDescription(stream.desc).Marshal(multicast)
-					res.Body = byts
-				}
+				byts, _ := serverSideDescription(stream.Desc).Marshal(multicast)
+				res.Body = byts
 			}
 
 			return res, err
@@ -369,14 +443,20 @@ func (sc *ServerConn) handleRequestOuter(req *base.Request) error {
 		res.Header = make(base.Header)
 	}
 
+	// handle auth errors
+	var eerr1 liberrors.ErrServerAuth
+	if errors.As(err, &eerr1) {
+		err = sc.handleAuthError(req, res)
+	}
+
 	// add cseq
-	var eerr liberrors.ErrServerCSeqMissing
-	if !errors.As(err, &eerr) {
+	var eerr2 liberrors.ErrServerCSeqMissing
+	if !errors.As(err, &eerr2) {
 		res.Header["CSeq"] = req.Header["CSeq"]
 	}
 
 	// add server
-	res.Header["Server"] = base.HeaderValue{"gortsplib"}
+	res.Header["Server"] = base.HeaderValue{serverHeader}
 
 	if h, ok := sc.s.Handler.(ServerHandlerOnResponse); ok {
 		h.OnResponse(sc, res)
@@ -443,23 +523,6 @@ func (sc *ServerConn) handleRequestInSession(
 func (sc *ServerConn) removeSession(ss *ServerSession) {
 	select {
 	case sc.chRemoveSession <- ss:
-	case <-sc.ctx.Done():
-	}
-}
-
-func (sc *ServerConn) readRequest(req readReq) error {
-	select {
-	case sc.chReadRequest <- req:
-		return <-req.res
-
-	case <-sc.ctx.Done():
-		return liberrors.ErrServerTerminated{}
-	}
-}
-
-func (sc *ServerConn) readError(err error) {
-	select {
-	case sc.chReadError <- err:
 	case <-sc.ctx.Done():
 	}
 }

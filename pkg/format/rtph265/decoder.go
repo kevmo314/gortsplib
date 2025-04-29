@@ -6,7 +6,7 @@ import (
 
 	"github.com/pion/rtp"
 
-	"github.com/bluenviron/mediacommon/pkg/codecs/h265"
+	"github.com/bluenviron/mediacommon/v2/pkg/codecs/h265"
 )
 
 // ErrMorePacketsNeeded is returned when more packets are needed.
@@ -26,6 +26,14 @@ func joinFragments(fragments [][]byte, size int) []byte {
 		n += copy(ret[n:], p)
 	}
 	return ret
+}
+
+func auSize(au [][]byte) int {
+	s := 0
+	for _, nalu := range au {
+		s += len(nalu)
+	}
+	return s
 }
 
 // Decoder is a RTP/H265 decoder.
@@ -81,7 +89,7 @@ func (d *Decoder) decodeNALUs(pkt *rtp.Packet) ([][]byte, error) {
 			size := uint16(payload[0])<<8 | uint16(payload[1])
 			payload = payload[2:]
 
-			if int(size) > len(payload) {
+			if size == 0 || int(size) > len(payload) {
 				return nil, fmt.Errorf("invalid aggregation unit (invalid size)")
 			}
 
@@ -91,10 +99,6 @@ func (d *Decoder) decodeNALUs(pkt *rtp.Packet) ([][]byte, error) {
 			if len(payload) == 0 {
 				break
 			}
-		}
-
-		if nalus == nil {
-			return nil, fmt.Errorf("aggregation unit doesn't contain any NALU")
 		}
 
 		d.firstPacketReceived = true
@@ -141,8 +145,10 @@ func (d *Decoder) decodeNALUs(pkt *rtp.Packet) ([][]byte, error) {
 		d.fragmentsSize += len(pkt.Payload[3:])
 
 		if d.fragmentsSize > h265.MaxAccessUnitSize {
+			errSize := d.fragmentsSize
 			d.resetFragments()
-			return nil, fmt.Errorf("NALU size (%d) is too big, maximum is %d", d.fragmentsSize, h265.MaxAccessUnitSize)
+			return nil, fmt.Errorf("NALU size (%d) is too big, maximum is %d",
+				errSize, h265.MaxAccessUnitSize)
 		}
 
 		d.fragments = append(d.fragments, pkt.Payload[3:])
@@ -176,25 +182,23 @@ func (d *Decoder) Decode(pkt *rtp.Packet) ([][]byte, error) {
 	l := len(nalus)
 
 	if (d.frameBufferLen + l) > h265.MaxNALUsPerAccessUnit {
+		errCount := d.frameBufferLen + l
 		d.frameBuffer = nil
 		d.frameBufferLen = 0
 		d.frameBufferSize = 0
-		return nil, fmt.Errorf("NALU count exceeds maximum allowed (%d)",
-			h265.MaxNALUsPerAccessUnit)
+		return nil, fmt.Errorf("NALU count (%d) exceeds maximum allowed (%d)",
+			errCount, h265.MaxNALUsPerAccessUnit)
 	}
 
-	addSize := 0
-
-	for _, nalu := range nalus {
-		addSize += len(nalu)
-	}
+	addSize := auSize(nalus)
 
 	if (d.frameBufferSize + addSize) > h265.MaxAccessUnitSize {
+		errSize := d.frameBufferSize + addSize
 		d.frameBuffer = nil
 		d.frameBufferLen = 0
 		d.frameBufferSize = 0
 		return nil, fmt.Errorf("access unit size (%d) is too big, maximum is %d",
-			d.frameBufferSize+addSize, h265.MaxAccessUnitSize)
+			errSize, h265.MaxAccessUnitSize)
 	}
 
 	d.frameBuffer = append(d.frameBuffer, nalus...)
